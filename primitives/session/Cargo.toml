@@ -1,5 +1,5 @@
 [package]
-name = "sp-sesssion"
+name = "sp-session"
 version = "2.0.0"
 authors = ["Parity Technologies <admin@parity.io>"]
 edition = "2018"
@@ -7,7 +7,7 @@ edition = "2018"
 [dependencies]
 sp-api = { path = "../sr-api", default-features = false }
 rstd = { package = "sp-std", path = "../sr-std", default-features = false }
-sp-runtime = { path = "../sr-primitives", optional = true }
+sp-runtime = { path = "../runtime", optional = true }
 
 [features]
 default = [ "std" ]

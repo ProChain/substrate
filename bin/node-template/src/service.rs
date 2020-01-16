@@ -12,6 +12,7 @@ pub use sc_executor::NativeExecutor;
 use sp_consensus_aura::sr25519::{AuthorityPair as AuraPair};
 use grandpa::{self, FinalityProofProvider as GrandpaFinalityProofProvider};
 use sc_basic_authority;
+use futures::{FutureExt, compat::Future01CompatExt};
 
 // Our native executor instance.
 native_executor_instance!(
@@ -56,9 +57,13 @@ macro_rules! new_full_start {
 						client.clone(), &*client, select_chain
 					)?;
 
-				let import_queue = sc_consensus_aura::import_queue::<_, _, AuraPair, _>(
+				let aura_block_import = sc_consensus_aura::AuraBlockImport::<_, _, _, AuraPair>::new(
+					grandpa_block_import.clone(), client.clone(),
+				);
+
+				let import_queue = sc_consensus_aura::import_queue::<_, _, _, AuraPair, _>(
 					sc_consensus_aura::SlotDuration::get_or_compute(&*client)?,
-					Box::new(grandpa_block_import.clone()),
+					aura_block_import,
 					Some(Box::new(grandpa_block_import.clone())),
 					None,
 					client,
@@ -114,7 +119,7 @@ pub fn new_full<C: Send + Default + 'static>(config: Configuration<C, GenesisCon
 		let can_author_with =
 			sp_consensus::CanAuthorWithNativeVersion::new(client.executor().clone());
 
-		let aura = sc_consensus_aura::start_aura::<_, _, _, _, _, AuraPair, _, _, _, _>(
+		let aura = sc_consensus_aura::start_aura::<_, _, _, _, _, AuraPair, _, _, _>(
 			sc_consensus_aura::SlotDuration::get_or_compute(&*client)?,
 			client,
 			select_chain,
@@ -159,7 +164,7 @@ pub fn new_full<C: Send + Default + 'static>(config: Configuration<C, GenesisCon
 				service.network(),
 				service.on_exit(),
 				service.spawn_task_handle(),
-			)?);
+			)?.compat().map(drop));
 		},
 		(true, false) => {
 			// start the full GRANDPA voter
@@ -176,7 +181,7 @@ pub fn new_full<C: Send + Default + 'static>(config: Configuration<C, GenesisCon
 
 			// the GRANDPA voter task is considered infallible, i.e.
 			// if it fails we take down the service with it.
-			service.spawn_essential_task(grandpa::run_grandpa_voter(voter_config)?);
+			service.spawn_essential_task(grandpa::run_grandpa_voter(voter_config)?.compat().map(drop));
 		},
 		(_, true) => {
 			grandpa::setup_disabled_grandpa(
@@ -220,9 +225,9 @@ pub fn new_light<C: Send + Default + 'static>(config: Configuration<C, GenesisCo
 			let finality_proof_request_builder =
 				finality_proof_import.create_finality_proof_request_builder();
 
-			let import_queue = sc_consensus_aura::import_queue::<_, _, AuraPair, ()>(
+			let import_queue = sc_consensus_aura::import_queue::<_, _, _, AuraPair, ()>(
 				sc_consensus_aura::SlotDuration::get_or_compute(&*client)?,
-				Box::new(grandpa_block_import),
+				grandpa_block_import,
 				None,
 				Some(Box::new(finality_proof_import)),
 				client,

@@ -22,7 +22,7 @@ use std::cell::RefCell;
 
 use crate::{Module, Trait};
 use sp_runtime::Perbill;
-use sp_staking::{SessionIndex, offence::ReportOffence};
+use sp_staking::{SessionIndex, offence::{ReportOffence, OffenceError}};
 use sp_runtime::testing::{Header, UintAuthorityId, TestXt};
 use sp_runtime::traits::{IdentityLookup, BlakeTwo256, ConvertInto};
 use sp_core::H256;
@@ -43,28 +43,27 @@ thread_local! {
 	pub static VALIDATORS: RefCell<Option<Vec<u64>>> = RefCell::new(Some(vec![1, 2, 3]));
 }
 
-pub struct TestOnSessionEnding;
-impl pallet_session::OnSessionEnding<u64> for TestOnSessionEnding {
-	fn on_session_ending(_ending_index: SessionIndex, _will_apply_at: SessionIndex)
-		-> Option<Vec<u64>>
-	{
+pub struct TestSessionManager;
+impl pallet_session::SessionManager<u64> for TestSessionManager {
+	fn new_session(_new_index: SessionIndex) -> Option<Vec<u64>> {
 		VALIDATORS.with(|l| l.borrow_mut().take())
 	}
+	fn end_session(_: SessionIndex) {}
+	fn start_session(_: SessionIndex) {}
 }
 
-impl pallet_session::historical::OnSessionEnding<u64, u64> for TestOnSessionEnding {
-	fn on_session_ending(_ending_index: SessionIndex, _will_apply_at: SessionIndex)
-		-> Option<(Vec<u64>, Vec<(u64, u64)>)>
-	{
+impl pallet_session::historical::SessionManager<u64, u64> for TestSessionManager {
+	fn new_session(_new_index: SessionIndex) -> Option<Vec<(u64, u64)>> {
 		VALIDATORS.with(|l| l
 			.borrow_mut()
 			.take()
 			.map(|validators| {
-				let full_identification = validators.iter().map(|v| (*v, *v)).collect();
-				(validators, full_identification)
+				validators.iter().map(|v| (*v, *v)).collect()
 			})
 		)
 	}
+	fn end_session(_: SessionIndex) {}
+	fn start_session(_: SessionIndex) {}
 }
 
 /// An extrinsic type used for tests.
@@ -80,8 +79,9 @@ thread_local! {
 /// A mock offence report handler.
 pub struct OffenceHandler;
 impl ReportOffence<u64, IdentificationTuple, Offence> for OffenceHandler {
-	fn report_offence(reporters: Vec<u64>, offence: Offence) {
+	fn report_offence(reporters: Vec<u64>, offence: Offence) -> Result<(), OffenceError> {
 		OFFENCES.with(|l| l.borrow_mut().push((reporters, offence)));
+		Ok(())
 	}
 }
 
@@ -118,6 +118,9 @@ impl frame_system::Trait for Runtime {
 	type AvailableBlockRatio = AvailableBlockRatio;
 	type Version = ();
 	type ModuleToIndex = ();
+	type AccountData = ();
+	type OnNewAccount = ();
+	type OnKilledAccount = ();
 }
 
 parameter_types! {
@@ -131,13 +134,12 @@ parameter_types! {
 
 impl pallet_session::Trait for Runtime {
 	type ShouldEndSession = pallet_session::PeriodicSessions<Period, Offset>;
-	type OnSessionEnding = pallet_session::historical::NoteHistoricalRoot<Runtime, TestOnSessionEnding>;
+	type SessionManager = pallet_session::historical::NoteHistoricalRoot<Runtime, TestSessionManager>;
 	type SessionHandler = (ImOnline, );
 	type ValidatorId = u64;
 	type ValidatorIdOf = ConvertInto;
 	type Keys = UintAuthorityId;
 	type Event = ();
-	type SelectInitialValidators = ();
 	type DisabledValidatorsThreshold = DisabledValidatorsThreshold;
 }
 

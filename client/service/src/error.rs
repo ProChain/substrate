@@ -40,6 +40,9 @@ pub enum Error {
 	/// Best chain selection strategy is missing.
 	#[display(fmt="Best chain selection strategy (SelectChain) is not provided.")]
 	SelectChainRequired,
+	/// Tasks executor is missing.
+	#[display(fmt="Tasks executor hasn't been provided.")]
+	TaskExecutorRequired,
 	/// Other error.
 	Other(String),
 }
@@ -47,6 +50,12 @@ pub enum Error {
 impl<'a> From<&'a str> for Error {
 	fn from(s: &'a str) -> Self {
 		Error::Other(s.into())
+	}
+}
+
+impl From<prometheus_endpoint::PrometheusError> for Error {
+	fn from(e: prometheus_endpoint::PrometheusError) -> Self {
+		Error::Other(format!("Prometheus error: {}", e))
 	}
 }
 

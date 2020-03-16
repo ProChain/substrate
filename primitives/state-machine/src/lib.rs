@@ -23,8 +23,8 @@ use log::{warn, trace};
 use hash_db::Hasher;
 use codec::{Decode, Encode, Codec};
 use sp_core::{
-	storage::{well_known_keys, ChildInfo}, NativeOrEncoded, NeverNativeValue,
-	traits::CodeExecutor, hexdisplay::HexDisplay
+	storage::ChildInfo, NativeOrEncoded, NeverNativeValue, hexdisplay::HexDisplay,
+	traits::{CodeExecutor, CallInWasmExt, RuntimeCode},
 };
 use overlayed_changes::OverlayedChangeSet;
 use sp_externalities::Extensions;
@@ -42,28 +42,32 @@ mod trie_backend;
 mod trie_backend_essence;
 mod stats;
 
-pub use sp_trie::{trie_types::{Layout, TrieDBMut}, TrieMut, DBValue, MemoryDB};
+pub use sp_trie::{trie_types::{Layout, TrieDBMut}, StorageProof, TrieMut, DBValue, MemoryDB};
 pub use testing::TestExternalities;
 pub use basic::BasicExternalities;
 pub use ext::Ext;
 pub use backend::Backend;
 pub use changes_trie::{
 	AnchorBlockId as ChangesTrieAnchorBlockId,
+	State as ChangesTrieState,
 	Storage as ChangesTrieStorage,
 	RootsStorage as ChangesTrieRootsStorage,
 	InMemoryStorage as InMemoryChangesTrieStorage,
 	BuildCache as ChangesTrieBuildCache,
 	CacheAction as ChangesTrieCacheAction,
 	ConfigurationRange as ChangesTrieConfigurationRange,
-	key_changes, key_changes_proof, key_changes_proof_check,
+	key_changes, key_changes_proof,
+	key_changes_proof_check, key_changes_proof_check_with_db,
 	prune as prune_changes_tries,
-	oldest_non_pruned_trie as oldest_non_pruned_changes_trie,
+	disabled_state as disabled_changes_trie_state,
 	BlockNumber as ChangesTrieBlockNumber,
 };
-pub use overlayed_changes::{OverlayedChanges, StorageChanges, StorageTransactionCache};
+pub use overlayed_changes::{
+	OverlayedChanges, StorageChanges, StorageTransactionCache, StorageKey, StorageValue,
+	StorageCollection, ChildStorageCollection,
+};
 pub use proving_backend::{
-	create_proof_check_backend, create_proof_check_backend_storage, merge_storage_proofs,
-	ProofRecorder, ProvingBackend, ProvingBackendRecorder, StorageProof,
+	create_proof_check_backend, ProofRecorder, ProvingBackend, ProvingBackendRecorder,
 };
 pub use trie_backend_essence::{TrieBackendStorage, Storage};
 pub use trie_backend::TrieBackend;
@@ -171,7 +175,7 @@ fn always_untrusted_wasm<E, R: Decode>() -> ExecutionManager<DefaultHandler<R, E
 }
 
 /// The substrate state machine.
-pub struct StateMachine<'a, B, H, N, T, Exec>
+pub struct StateMachine<'a, B, H, N, Exec>
 	where
 		H: Hasher,
 		B: Backend<H>,
@@ -183,29 +187,32 @@ pub struct StateMachine<'a, B, H, N, T, Exec>
 	call_data: &'a [u8],
 	overlay: &'a mut OverlayedChanges,
 	extensions: Extensions,
-	changes_trie_storage: Option<&'a T>,
+	changes_trie_state: Option<ChangesTrieState<'a, H, N>>,
 	_marker: PhantomData<(H, N)>,
 	storage_transaction_cache: Option<&'a mut StorageTransactionCache<B::Transaction, H, N>>,
+	runtime_code: &'a RuntimeCode<'a>,
 }
 
-impl<'a, B, H, N, T, Exec> StateMachine<'a, B, H, N, T, Exec> where
+impl<'a, B, H, N, Exec> StateMachine<'a, B, H, N, Exec> where
 	H: Hasher,
 	H::Out: Ord + 'static + codec::Codec,
-	Exec: CodeExecutor,
+	Exec: CodeExecutor + Clone + 'static,
 	B: Backend<H>,
-	T: ChangesTrieStorage<H, N>,
 	N: crate::changes_trie::BlockNumber,
 {
 	/// Creates new substrate state machine.
 	pub fn new(
 		backend: &'a B,
-		changes_trie_storage: Option<&'a T>,
+		changes_trie_state: Option<ChangesTrieState<'a, H, N>>,
 		overlay: &'a mut OverlayedChanges,
 		exec: &'a Exec,
 		method: &'a str,
 		call_data: &'a [u8],
-		extensions: Extensions,
+		mut extensions: Extensions,
+		runtime_code: &'a RuntimeCode,
 	) -> Self {
+		extensions.register(CallInWasmExt::new(exec.clone()));
+
 		Self {
 			backend,
 			exec,
@@ -213,9 +220,10 @@ impl<'a, B, H, N, T, Exec> StateMachine<'a, B, H, N, T, Exec> where
 			call_data,
 			extensions,
 			overlay,
-			changes_trie_storage,
+			changes_trie_state,
 			_marker: PhantomData,
 			storage_transaction_cache: None,
+			runtime_code,
 		}
 	}
 
@@ -271,7 +279,7 @@ impl<'a, B, H, N, T, Exec> StateMachine<'a, B, H, N, T, Exec> where
 			self.overlay,
 			cache,
 			self.backend,
-			self.changes_trie_storage.clone(),
+			self.changes_trie_state.clone(),
 			Some(&mut self.extensions),
 		);
 
@@ -286,6 +294,7 @@ impl<'a, B, H, N, T, Exec> StateMachine<'a, B, H, N, T, Exec> where
 
 		let (result, was_native) = self.exec.call(
 			&mut ext,
+			self.runtime_code,
 			self.method,
 			self.call_data,
 			use_native,
@@ -371,7 +380,7 @@ impl<'a, B, H, N, T, Exec> StateMachine<'a, B, H, N, T, Exec> where
 	/// Note: changes to code will be in place if this call is made again. For running partial
 	/// blocks (e.g. a transaction at a time), ensure a different method is used.
 	///
-	/// Returns the result of the executed function either in native reprensentation `R` or
+	/// Returns the result of the executed function either in native representation `R` or
 	/// in SCALE encoded representation.
 	pub fn execute_using_consensus_failure_handler<Handler, R, NC>(
 		&mut self,
@@ -386,20 +395,8 @@ impl<'a, B, H, N, T, Exec> StateMachine<'a, B, H, N, T, Exec> where
 				CallResult<R, Exec::Error>,
 			) -> CallResult<R, Exec::Error>
 	{
-		// read changes trie configuration. The reason why we're doing it here instead of the
-		// `OverlayedChanges` constructor is that we need proofs for this read as a part of
-		// proof-of-execution on light clients. And the proof is recorded by the backend which
-		// is created after OverlayedChanges
-
-		let init_overlay = |overlay: &mut OverlayedChanges, final_check: bool, backend: &B| {
-			let changes_trie_config = try_read_overlay_value(
-				overlay,
-				backend,
-				well_known_keys::CHANGES_TRIE_CONFIG
-			)?;
-			set_changes_trie_config(overlay, changes_trie_config, final_check)
-		};
-		init_overlay(self.overlay, false, &self.backend)?;
+		let changes_tries_enabled = self.changes_trie_state.is_some();
+		self.overlay.set_collect_extrinsics(changes_tries_enabled);
 
 		let result = {
 			let orig_prospective = self.overlay.prospective.clone();
@@ -431,31 +428,36 @@ impl<'a, B, H, N, T, Exec> StateMachine<'a, B, H, N, T, Exec> where
 			}
 		};
 
-		if result.is_ok() {
-			init_overlay(self.overlay, true, self.backend)?;
-		}
-
 		result.map_err(|e| Box::new(e) as _)
 	}
 }
 
 /// Prove execution using the given state backend, overlayed changes, and call executor.
-pub fn prove_execution<B, H, Exec>(
+pub fn prove_execution<B, H, N, Exec>(
 	mut backend: B,
 	overlay: &mut OverlayedChanges,
 	exec: &Exec,
 	method: &str,
 	call_data: &[u8],
+	runtime_code: &RuntimeCode,
 ) -> Result<(Vec<u8>, StorageProof), Box<dyn Error>>
 where
 	B: Backend<H>,
 	H: Hasher,
 	H::Out: Ord + 'static + codec::Codec,
-	Exec: CodeExecutor,
+	Exec: CodeExecutor + Clone + 'static,
+	N: crate::changes_trie::BlockNumber,
 {
 	let trie_backend = backend.as_trie_backend()
 		.ok_or_else(|| Box::new(ExecutionError::UnableToGenerateProof) as Box<dyn Error>)?;
-	prove_execution_on_trie_backend(trie_backend, overlay, exec, method, call_data)
+	prove_execution_on_trie_backend::<_, _, N, _>(
+		trie_backend,
+		overlay,
+		exec,
+		method,
+		call_data,
+		runtime_code,
+	)
 }
 
 /// Prove execution using the given trie backend, overlayed changes, and call executor.
@@ -467,22 +469,31 @@ where
 ///
 /// Note: changes to code will be in place if this call is made again. For running partial
 /// blocks (e.g. a transaction at a time), ensure a different method is used.
-pub fn prove_execution_on_trie_backend<S, H, Exec>(
+pub fn prove_execution_on_trie_backend<S, H, N, Exec>(
 	trie_backend: &TrieBackend<S, H>,
 	overlay: &mut OverlayedChanges,
 	exec: &Exec,
 	method: &str,
 	call_data: &[u8],
+	runtime_code: &RuntimeCode,
 ) -> Result<(Vec<u8>, StorageProof), Box<dyn Error>>
 where
 	S: trie_backend_essence::TrieBackendStorage<H>,
 	H: Hasher,
 	H::Out: Ord + 'static + codec::Codec,
-	Exec: CodeExecutor,
+	Exec: CodeExecutor + 'static + Clone,
+	N: crate::changes_trie::BlockNumber,
 {
 	let proving_backend = proving_backend::ProvingBackend::new(trie_backend);
-	let mut sm = StateMachine::<_, H, _, InMemoryChangesTrieStorage<H, u64>, Exec>::new(
-		&proving_backend, None, overlay, exec, method, call_data, Extensions::default(),
+	let mut sm = StateMachine::<_, H, N, Exec>::new(
+		&proving_backend,
+		None,
+		overlay,
+		exec,
+		method,
+		call_data,
+		Extensions::default(),
+		runtime_code,
 	);
 
 	let result = sm.execute_using_consensus_failure_handler::<_, NeverNativeValue, fn() -> _>(
@@ -494,38 +505,56 @@ where
 }
 
 /// Check execution proof, generated by `prove_execution` call.
-pub fn execution_proof_check<H, Exec>(
+pub fn execution_proof_check<H, N, Exec>(
 	root: H::Out,
 	proof: StorageProof,
 	overlay: &mut OverlayedChanges,
 	exec: &Exec,
 	method: &str,
 	call_data: &[u8],
+	runtime_code: &RuntimeCode,
 ) -> Result<Vec<u8>, Box<dyn Error>>
 where
 	H: Hasher,
-	Exec: CodeExecutor,
+	Exec: CodeExecutor + Clone + 'static,
 	H::Out: Ord + 'static + codec::Codec,
+	N: crate::changes_trie::BlockNumber,
 {
 	let trie_backend = create_proof_check_backend::<H>(root.into(), proof)?;
-	execution_proof_check_on_trie_backend(&trie_backend, overlay, exec, method, call_data)
+	execution_proof_check_on_trie_backend::<_, N, _>(
+		&trie_backend,
+		overlay,
+		exec,
+		method,
+		call_data,
+		runtime_code,
+	)
 }
 
 /// Check execution proof on proving backend, generated by `prove_execution` call.
-pub fn execution_proof_check_on_trie_backend<H, Exec>(
+pub fn execution_proof_check_on_trie_backend<H, N, Exec>(
 	trie_backend: &TrieBackend<MemoryDB<H>, H>,
 	overlay: &mut OverlayedChanges,
 	exec: &Exec,
 	method: &str,
 	call_data: &[u8],
+	runtime_code: &RuntimeCode,
 ) -> Result<Vec<u8>, Box<dyn Error>>
 where
 	H: Hasher,
 	H::Out: Ord + 'static + codec::Codec,
-	Exec: CodeExecutor,
+	Exec: CodeExecutor + Clone + 'static,
+	N: crate::changes_trie::BlockNumber,
 {
-	let mut sm = StateMachine::<_, H, _, InMemoryChangesTrieStorage<H, u64>, Exec>::new(
-		trie_backend, None, overlay, exec, method, call_data, Extensions::default(),
+	let mut sm = StateMachine::<_, H, N, Exec>::new(
+		trie_backend,
+		None,
+		overlay,
+		exec,
+		method,
+		call_data,
+		Extensions::default(),
+		runtime_code,
 	);
 
 	sm.execute_using_consensus_failure_handler::<_, NeverNativeValue, fn() -> _>(
@@ -690,44 +719,6 @@ where
 		.map_err(|e| Box::new(e) as Box<dyn Error>)
 }
 
-/// Sets overlayed changes' changes trie configuration. Returns error if configuration
-/// differs from previous OR config decode has failed.
-fn set_changes_trie_config(
-	overlay: &mut OverlayedChanges,
-	config: Option<Vec<u8>>,
-	final_check: bool,
-) -> Result<(), Box<dyn Error>> {
-	let config = match config {
-		Some(v) => Some(Decode::decode(&mut &v[..])
-			.map_err(|_| Box::new("Failed to decode changes trie configuration".to_owned()) as Box<dyn Error>)?),
-		None => None,
-	};
-
-	if final_check && overlay.changes_trie_config.is_some() != config.is_some() {
-		return Err(Box::new("Changes trie configuration change is not supported".to_owned()));
-	}
-
-	if let Some(config) = config {
-		if !overlay.set_changes_trie_config(config) {
-			return Err(Box::new("Changes trie configuration change is not supported".to_owned()));
-		}
-	}
-	Ok(())
-}
-
-/// Reads storage value from overlay or from the backend.
-fn try_read_overlay_value<H, B>(
-	overlay: &OverlayedChanges,
-	backend: &B, key: &[u8],
-) -> Result<Option<Vec<u8>>, Box<dyn Error>> where H: Hasher, B: Backend<H> {
-	match overlay.storage(key).map(|x| x.map(|x| x.to_vec())) {
-		Some(value) => Ok(value),
-		None => backend
-			.storage(key)
-			.map_err(|err| Box::new(ExecutionError::Backend(format!("{}", err))) as Box<dyn Error>),
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use std::collections::BTreeMap;
@@ -735,12 +726,11 @@ mod tests {
 	use overlayed_changes::OverlayedValue;
 	use super::*;
 	use super::ext::Ext;
-	use super::changes_trie::{
-		InMemoryStorage as InMemoryChangesTrieStorage,
-		Configuration as ChangesTrieConfig,
-	};
-	use sp_core::{Blake2Hasher, map, traits::Externalities, storage::ChildStorageKey};
+	use super::changes_trie::Configuration as ChangesTrieConfig;
+	use sp_core::{map, traits::{Externalities, RuntimeCode}, storage::ChildStorageKey};
+	use sp_runtime::traits::BlakeTwo256;
 
+	#[derive(Clone)]
 	struct DummyCodeExecutor {
 		change_changes_trie_config: bool,
 		native_available: bool,
@@ -754,12 +744,12 @@ mod tests {
 		type Error = u8;
 
 		fn call<
-			E: Externalities,
 			R: Encode + Decode + PartialEq,
 			NC: FnOnce() -> result::Result<R, String>,
 		>(
 			&self,
-			ext: &mut E,
+			ext: &mut dyn Externalities,
+			_: &RuntimeCode,
 			_method: &str,
 			_data: &[u8],
 			use_native: bool,
@@ -767,7 +757,7 @@ mod tests {
 		) -> (CallResult<R, Self::Error>, bool) {
 			if self.change_changes_trie_config {
 				ext.place_storage(
-					well_known_keys::CHANGES_TRIE_CONFIG.to_vec(),
+					sp_core::storage::well_known_keys::CHANGES_TRIE_CONFIG.to_vec(),
 					Some(
 						ChangesTrieConfig {
 							digest_interval: 777,
@@ -797,15 +787,28 @@ mod tests {
 		}
 	}
 
+	impl sp_core::traits::CallInWasm for DummyCodeExecutor {
+		fn call_in_wasm(
+			&self,
+			_: &[u8],
+			_: Option<Vec<u8>>,
+			_: &str,
+			_: &[u8],
+			_: &mut dyn Externalities,
+		) -> std::result::Result<Vec<u8>, String> {
+			unimplemented!("Not required in tests.")
+		}
+	}
+
 	#[test]
 	fn execute_works() {
 		let backend = trie_backend::tests::test_trie();
 		let mut overlayed_changes = Default::default();
-		let changes_trie_storage = InMemoryChangesTrieStorage::<Blake2Hasher, u64>::new();
+		let wasm_code = RuntimeCode::empty();
 
 		let mut state_machine = StateMachine::new(
 			&backend,
-			Some(&changes_trie_storage),
+			changes_trie::disabled_state::<_, u64>(),
 			&mut overlayed_changes,
 			&DummyCodeExecutor {
 				change_changes_trie_config: false,
@@ -816,6 +819,7 @@ mod tests {
 			"test",
 			&[],
 			Default::default(),
+			&wasm_code,
 		);
 
 		assert_eq!(
@@ -829,11 +833,11 @@ mod tests {
 	fn execute_works_with_native_else_wasm() {
 		let backend = trie_backend::tests::test_trie();
 		let mut overlayed_changes = Default::default();
-		let changes_trie_storage = InMemoryChangesTrieStorage::<Blake2Hasher, u64>::new();
+		let wasm_code = RuntimeCode::empty();
 
 		let mut state_machine = StateMachine::new(
 			&backend,
-			Some(&changes_trie_storage),
+			changes_trie::disabled_state::<_, u64>(),
 			&mut overlayed_changes,
 			&DummyCodeExecutor {
 				change_changes_trie_config: false,
@@ -844,6 +848,7 @@ mod tests {
 			"test",
 			&[],
 			Default::default(),
+			&wasm_code,
 		);
 
 		assert_eq!(state_machine.execute(ExecutionStrategy::NativeElseWasm).unwrap(), vec![66]);
@@ -854,11 +859,11 @@ mod tests {
 		let mut consensus_failed = false;
 		let backend = trie_backend::tests::test_trie();
 		let mut overlayed_changes = Default::default();
-		let changes_trie_storage = InMemoryChangesTrieStorage::<Blake2Hasher, u64>::new();
+		let wasm_code = RuntimeCode::empty();
 
 		let mut state_machine = StateMachine::new(
 			&backend,
-			Some(&changes_trie_storage),
+			changes_trie::disabled_state::<_, u64>(),
 			&mut overlayed_changes,
 			&DummyCodeExecutor {
 				change_changes_trie_config: false,
@@ -869,6 +874,7 @@ mod tests {
 			"test",
 			&[],
 			Default::default(),
+			&wasm_code,
 		);
 
 		assert!(
@@ -895,22 +901,24 @@ mod tests {
 		// fetch execution proof from 'remote' full node
 		let remote_backend = trie_backend::tests::test_trie();
 		let remote_root = remote_backend.storage_root(std::iter::empty()).0;
-		let (remote_result, remote_proof) = prove_execution(
+		let (remote_result, remote_proof) = prove_execution::<_, _, u64, _>(
 			remote_backend,
 			&mut Default::default(),
 			&executor,
 			"test",
 			&[],
+			&RuntimeCode::empty(),
 		).unwrap();
 
 		// check proof locally
-		let local_result = execution_proof_check::<Blake2Hasher, _>(
+		let local_result = execution_proof_check::<BlakeTwo256, u64, _>(
 			remote_root,
 			remote_proof,
 			&mut Default::default(),
 			&executor,
 			"test",
 			&[],
+			&RuntimeCode::empty(),
 		).unwrap();
 
 		// check that both results are correct
@@ -926,7 +934,7 @@ mod tests {
 			b"abc".to_vec() => b"2".to_vec(),
 			b"bbb".to_vec() => b"3".to_vec()
 		];
-		let mut state = InMemoryBackend::<Blake2Hasher>::from(initial);
+		let mut state = InMemoryBackend::<BlakeTwo256>::from(initial);
 		let backend = state.as_trie_backend().unwrap();
 		let mut overlay = OverlayedChanges {
 			committed: map![
@@ -941,13 +949,12 @@ mod tests {
 		};
 
 		{
-			let changes_trie_storage = InMemoryChangesTrieStorage::<Blake2Hasher, u64>::new();
 			let mut cache = StorageTransactionCache::default();
 			let mut ext = Ext::new(
 				&mut overlay,
 				&mut cache,
 				backend,
-				Some(&changes_trie_storage),
+				changes_trie::disabled_state::<_, u64>(),
 				None,
 			);
 			ext.clear_prefix(b"ab");
@@ -970,16 +977,15 @@ mod tests {
 
 	#[test]
 	fn set_child_storage_works() {
-		let mut state = InMemoryBackend::<Blake2Hasher>::default();
+		let mut state = InMemoryBackend::<BlakeTwo256>::default();
 		let backend = state.as_trie_backend().unwrap();
-		let changes_trie_storage = InMemoryChangesTrieStorage::<Blake2Hasher, u64>::new();
 		let mut overlay = OverlayedChanges::default();
 		let mut cache = StorageTransactionCache::default();
 		let mut ext = Ext::new(
 			&mut overlay,
 			&mut cache,
 			backend,
-			Some(&changes_trie_storage),
+			changes_trie::disabled_state::<_, u64>(),
 			None,
 		);
 
@@ -1018,12 +1024,12 @@ mod tests {
 		let remote_root = remote_backend.storage_root(::std::iter::empty()).0;
 		let remote_proof = prove_read(remote_backend, &[b"value2"]).unwrap();
  		// check proof locally
-		let local_result1 = read_proof_check::<Blake2Hasher, _>(
+		let local_result1 = read_proof_check::<BlakeTwo256, _>(
 			remote_root,
 			remote_proof.clone(),
 			&[b"value2"],
 		).unwrap();
-		let local_result2 = read_proof_check::<Blake2Hasher, _>(
+		let local_result2 = read_proof_check::<BlakeTwo256, _>(
 			remote_root,
 			remote_proof.clone(),
 			&[&[0xff]],
@@ -1043,13 +1049,13 @@ mod tests {
 			CHILD_INFO_1,
 			&[b"value3"],
 		).unwrap();
-		let local_result1 = read_child_proof_check::<Blake2Hasher, _>(
+		let local_result1 = read_child_proof_check::<BlakeTwo256, _>(
 			remote_root,
 			remote_proof.clone(),
 			b":child_storage:default:sub1",
 			&[b"value3"],
 		).unwrap();
-		let local_result2 = read_child_proof_check::<Blake2Hasher, _>(
+		let local_result2 = read_child_proof_check::<BlakeTwo256, _>(
 			remote_root,
 			remote_proof.clone(),
 			b":child_storage:default:sub1",
@@ -1066,30 +1072,6 @@ mod tests {
 	}
 
 	#[test]
-	fn cannot_change_changes_trie_config() {
-		let backend = trie_backend::tests::test_trie();
-		let mut overlayed_changes = Default::default();
-		let changes_trie_storage = InMemoryChangesTrieStorage::<Blake2Hasher, u64>::new();
-
-		let mut state_machine = StateMachine::new(
-			&backend,
-			Some(&changes_trie_storage),
-			&mut overlayed_changes,
-			&DummyCodeExecutor {
-				change_changes_trie_config: true,
-				native_available: false,
-				native_succeeds: true,
-				fallback_succeeds: true,
-			},
-			"test",
-			&[],
-			Default::default(),
-		);
-
-		assert!(state_machine.execute(ExecutionStrategy::NativeWhenPossible).is_err());
-	}
-
-	#[test]
 	fn child_storage_uuid() {
 		const CHILD_INFO_1: ChildInfo<'static> = ChildInfo::new_default(b"unique_id_1");
 		const CHILD_INFO_2: ChildInfo<'static> = ChildInfo::new_default(b"unique_id_2");
@@ -1100,13 +1082,12 @@ mod tests {
 		let subtrie2 = ChildStorageKey::from_slice(b":child_storage:default:sub_test2").unwrap();
 		let mut transaction = {
 			let backend = test_trie();
-			let changes_trie_storage = InMemoryChangesTrieStorage::<Blake2Hasher, u64>::new();
 			let mut cache = StorageTransactionCache::default();
 			let mut ext = Ext::new(
 				&mut overlay,
 				&mut cache,
 				&backend,
-				Some(&changes_trie_storage),
+				changes_trie::disabled_state::<_, u64>(),
 				None,
 			);
 			ext.set_child_storage(subtrie1, CHILD_INFO_1, b"abc".to_vec(), b"def".to_vec());
@@ -1123,29 +1104,5 @@ mod tests {
 			}
 		}
 		assert!(!duplicate);
-	}
-
-	#[test]
-	fn cannot_change_changes_trie_config_with_native_else_wasm() {
-		let backend = trie_backend::tests::test_trie();
-		let mut overlayed_changes = Default::default();
-		let changes_trie_storage = InMemoryChangesTrieStorage::<Blake2Hasher, u64>::new();
-
-		let mut state_machine = StateMachine::new(
-			&backend,
-			Some(&changes_trie_storage),
-			&mut overlayed_changes,
-			&DummyCodeExecutor {
-				change_changes_trie_config: true,
-				native_available: false,
-				native_succeeds: true,
-				fallback_succeeds: true,
-			},
-			"test",
-			&[],
-			Default::default(),
-		);
-
-		assert!(state_machine.execute(ExecutionStrategy::NativeElseWasm).is_err());
 	}
 }

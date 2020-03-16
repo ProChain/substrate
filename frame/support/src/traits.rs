@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Traits for SRML.
+//! Traits for FRAME.
 //!
 //! NOTE: If you're looking for `parameter_types`, it has moved in to the top-level module.
 
@@ -22,11 +22,121 @@ use sp_std::{prelude::*, result, marker::PhantomData, ops::Div, fmt::Debug};
 use codec::{FullCodec, Codec, Encode, Decode};
 use sp_core::u32_trait::Value as U32;
 use sp_runtime::{
+	RuntimeDebug,
 	ConsensusEngineId, DispatchResult, DispatchError,
-	traits::{MaybeSerializeDeserialize, SimpleArithmetic, Saturating, TrailingZeroInput},
+	traits::{MaybeSerializeDeserialize, AtLeast32Bit, Saturating, TrailingZeroInput},
 };
 
 use crate::dispatch::Parameter;
+use crate::storage::StorageMap;
+
+/// An abstraction of a value stored within storage, but possibly as part of a larger composite
+/// item.
+pub trait StoredMap<K, T> {
+	/// Get the item, or its default if it doesn't yet exist; we make no distinction between the
+	/// two.
+	fn get(k: &K) -> T;
+	/// Get whether the item takes up any storage. If this is `false`, then `get` will certainly
+	/// return the `T::default()`. If `true`, then there is no implication for `get` (i.e. it
+	/// may return any value, including the default).
+	///
+	/// NOTE: This may still be `true`, even after `remove` is called. This is the case where
+	/// a single storage entry is shared between multiple `StoredMap` items single, without
+	/// additional logic to enforce it, deletion of any one them doesn't automatically imply
+	/// deletion of them all.
+	fn is_explicit(k: &K) -> bool;
+	/// Mutate the item.
+	fn mutate<R>(k: &K, f: impl FnOnce(&mut T) -> R) -> R;
+	/// Mutate the item, removing or resetting to default value if it has been mutated to `None`.
+	fn mutate_exists<R>(k: &K, f: impl FnOnce(&mut Option<T>) -> R) -> R;
+	/// Maybe mutate the item only if an `Ok` value is returned from `f`. Do nothing if an `Err` is
+	/// returned. It is removed or reset to default value if it has been mutated to `None`
+	fn try_mutate_exists<R, E>(k: &K, f: impl FnOnce(&mut Option<T>) -> Result<R, E>) -> Result<R, E>;
+	/// Set the item to something new.
+	fn insert(k: &K, t: T) { Self::mutate(k, |i| *i = t); }
+	/// Remove the item or otherwise replace it with its default value; we don't care which.
+	fn remove(k: &K);
+}
+
+/// A simple, generic one-parameter event notifier/handler.
+pub trait Happened<T> {
+	/// The thing happened.
+	fn happened(t: &T);
+}
+
+/// A shim for placing around a storage item in order to use it as a `StoredValue`. Ideally this
+/// wouldn't be needed as `StorageValue`s should blanket implement `StoredValue`s, however this
+/// would break the ability to have custom impls of `StoredValue`. The other workaround is to
+/// implement it directly in the macro.
+///
+/// This form has the advantage that two additional types are provides, `Created` and `Removed`,
+/// which are both generic events that can be tied to handlers to do something in the case of being
+/// about to create an account where one didn't previously exist (at all; not just where it used to
+/// be the default value), or where the account is being removed or reset back to the default value
+/// where previously it did exist (though may have been in a default state). This works well with
+/// system module's `CallOnCreatedAccount` and `CallKillAccount`.
+pub struct StorageMapShim<
+	S,
+	Created,
+	Removed,
+	K,
+	T
+>(sp_std::marker::PhantomData<(S, Created, Removed, K, T)>);
+impl<
+	S: StorageMap<K, T, Query=T>,
+	Created: Happened<K>,
+	Removed: Happened<K>,
+	K: FullCodec,
+	T: FullCodec
+> StoredMap<K, T> for StorageMapShim<S, Created, Removed, K, T> {
+	fn get(k: &K) -> T { S::get(k) }
+	fn is_explicit(k: &K) -> bool { S::contains_key(k) }
+	fn insert(k: &K, t: T) {
+		S::insert(k, t);
+		if !S::contains_key(&k) {
+			Created::happened(k);
+		}
+	}
+	fn remove(k: &K) {
+		if S::contains_key(&k) {
+			Removed::happened(&k);
+		}
+		S::remove(k);
+	}
+	fn mutate<R>(k: &K, f: impl FnOnce(&mut T) -> R) -> R {
+		let r = S::mutate(k, f);
+		if !S::contains_key(&k) {
+			Created::happened(k);
+		}
+		r
+	}
+	fn mutate_exists<R>(k: &K, f: impl FnOnce(&mut Option<T>) -> R) -> R {
+		let (existed, exists, r) = S::mutate_exists(k, |maybe_value| {
+			let existed = maybe_value.is_some();
+			let r = f(maybe_value);
+			(existed, maybe_value.is_some(), r)
+		});
+		if !existed && exists {
+			Created::happened(k);
+		} else if existed && !exists {
+			Removed::happened(k);
+		}
+		r
+	}
+	fn try_mutate_exists<R, E>(k: &K, f: impl FnOnce(&mut Option<T>) -> Result<R, E>) -> Result<R, E> {
+		S::try_mutate_exists(k, |maybe_value| {
+			let existed = maybe_value.is_some();
+			f(maybe_value).map(|v| (existed, maybe_value.is_some(), v))
+		}).map(|(existed, exists, v)| {
+			if !existed && exists {
+				Created::happened(k);
+			} else if existed && !exists {
+				Removed::happened(k);
+			}
+			v
+		})
+	}
+}
 
 /// Anything that can have a `::len()` method.
 pub trait Len {
@@ -64,26 +174,30 @@ pub trait Contains<T: Ord> {
 	fn count() -> usize { Self::sorted_members().len() }
 }
 
-/// The account with the given id was killed.
+/// Determiner to say whether a given account is unused.
+pub trait IsDeadAccount<AccountId> {
+	/// Is the given account dead?
+	fn is_dead_account(who: &AccountId) -> bool;
+}
+
+impl<AccountId> IsDeadAccount<AccountId> for () {
+	fn is_dead_account(_who: &AccountId) -> bool {
+		true
+	}
+}
+
+/// Handler for when a new account has been created.
 #[impl_trait_for_tuples::impl_for_tuples(30)]
-pub trait OnFreeBalanceZero<AccountId> {
-	/// The account with the given id was killed.
-	fn on_free_balance_zero(who: &AccountId);
+pub trait OnNewAccount<AccountId> {
+	/// A new account `who` has been registered.
+	fn on_new_account(who: &AccountId);
 }
 
 /// The account with the given id was reaped.
 #[impl_trait_for_tuples::impl_for_tuples(30)]
-pub trait OnReapAccount<AccountId> {
+pub trait OnKilledAccount<AccountId> {
 	/// The account with the given id was reaped.
-	fn on_reap_account(who: &AccountId);
-}
-
-/// Outcome of a balance update.
-pub enum UpdateBalanceOutcome {
-	/// Account balance was simply updated.
-	Updated,
-	/// The update led to killing the account.
-	AccountKilled,
+	fn on_killed_account(who: &AccountId);
 }
 
 /// A trait for finding the author of a block header based on the `PreRuntime` digests contained
@@ -142,6 +256,13 @@ pub trait KeyOwnerProofSystem<Key> {
 /// - Someone got slashed.
 /// - Someone paid for a transaction to be included.
 pub trait OnUnbalanced<Imbalance: TryDrop> {
+	/// Handler for some imbalances. The different imbalances might have different origins or
+	/// meanings, dependent on the context. Will default to simply calling on_unbalanced for all
+	/// of them. Infallible.
+	fn on_unbalanceds<B>(amounts: impl Iterator<Item=Imbalance>) where Imbalance: crate::traits::Imbalance<B> {
+		Self::on_unbalanced(amounts.fold(Imbalance::zero(), |i, x| x.merge(i)))
+	}
+
 	/// Handler for some imbalance. Infallible.
 	fn on_unbalanced(amount: Imbalance) {
 		amount.try_drop().unwrap_or_else(Self::on_nonzero_unbalanced)
@@ -149,12 +270,10 @@ pub trait OnUnbalanced<Imbalance: TryDrop> {
 
 	/// Actually handle a non-zero imbalance. You probably want to implement this rather than
 	/// `on_unbalanced`.
-	fn on_nonzero_unbalanced(amount: Imbalance);
-}
-
-impl<Imbalance: TryDrop> OnUnbalanced<Imbalance> for () {
 	fn on_nonzero_unbalanced(amount: Imbalance) { drop(amount); }
 }
+
+impl<Imbalance: TryDrop> OnUnbalanced<Imbalance> for () {}
 
 /// Simple boolean for whether an account needs to be kept in existence.
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -217,9 +336,70 @@ pub trait Imbalance<Balance>: Sized + TryDrop {
 	/// is guaranteed to be at most `amount` and the second will be the remainder.
 	fn split(self, amount: Balance) -> (Self, Self);
 
+	/// Consume `self` and return two independent instances; the amounts returned will be in
+	/// approximately the same ratio as `first`:`second`.
+	///
+	/// NOTE: This requires up to `first + second` room for a multiply, and `first + second` should
+	/// fit into a `u32`. Overflow will safely saturate in both cases.
+	fn ration(self, first: u32, second: u32) -> (Self, Self)
+		where Balance: From<u32> + Saturating + Div<Output=Balance>
+	{
+		let total: u32 = first.saturating_add(second);
+		let amount1 = self.peek().saturating_mul(first.into()) / total.into();
+		self.split(amount1)
+	}
+
+	/// Consume self and add its two components, defined by the first component's balance,
+	/// element-wise to two pre-existing Imbalances.
+	///
+	/// A convenient replacement for `split` and `merge`.
+	fn split_merge(self, amount: Balance, others: (Self, Self)) -> (Self, Self) {
+		let (a, b) = self.split(amount);
+		(a.merge(others.0), b.merge(others.1))
+	}
+
+	/// Consume self and add its two components, defined by the ratio `first`:`second`,
+	/// element-wise to two pre-existing Imbalances.
+	///
+	/// A convenient replacement for `split` and `merge`.
+	fn ration_merge(self, first: u32, second: u32, others: (Self, Self)) -> (Self, Self)
+		where Balance: From<u32> + Saturating + Div<Output=Balance>
+	{
+		let (a, b) = self.ration(first, second);
+		(a.merge(others.0), b.merge(others.1))
+	}
+
+	/// Consume self and add its two components, defined by the first component's balance,
+	/// element-wise into two pre-existing Imbalance refs.
+	///
+	/// A convenient replacement for `split` and `subsume`.
+	fn split_merge_into(self, amount: Balance, others: &mut (Self, Self)) {
+		let (a, b) = self.split(amount);
+		others.0.subsume(a);
+		others.1.subsume(b);
+	}
+
+	/// Consume self and add its two components, defined by the ratio `first`:`second`,
+	/// element-wise to two pre-existing Imbalances.
+	///
+	/// A convenient replacement for `split` and `merge`.
+	fn ration_merge_into(self, first: u32, second: u32, others: &mut (Self, Self))
+		where Balance: From<u32> + Saturating + Div<Output=Balance>
+	{
+		let (a, b) = self.ration(first, second);
+		others.0.subsume(a);
+		others.1.subsume(b);
+	}
+
 	/// Consume `self` and an `other` to return a new instance that combines
 	/// both.
 	fn merge(self, other: Self) -> Self;
+
+	/// Consume self to mutate `other` so that it combines both. Just like `subsume`, only with
+	/// reversed arguments.
+	fn merge_into(self, other: &mut Self) {
+		other.subsume(self)
+	}
 
 	/// Consume `self` and maybe an `other` to return a new instance that combines
 	/// both.
@@ -267,7 +447,7 @@ pub enum SignedImbalance<B, P: Imbalance<B>>{
 impl<
 	P: Imbalance<B, Opposite=N>,
 	N: Imbalance<B, Opposite=P>,
-	B: SimpleArithmetic + FullCodec + Copy + MaybeSerializeDeserialize + Debug + Default,
+	B: AtLeast32Bit + FullCodec + Copy + MaybeSerializeDeserialize + Debug + Default,
 > SignedImbalance<B, P> {
 	pub fn zero() -> Self {
 		SignedImbalance::Positive(P::zero())
@@ -330,7 +510,7 @@ impl<
 /// Abstraction over a fungible assets system.
 pub trait Currency<AccountId> {
 	/// The balance of an account.
-	type Balance: SimpleArithmetic + FullCodec + Copy + MaybeSerializeDeserialize + Debug + Default;
+	type Balance: AtLeast32Bit + FullCodec + Copy + MaybeSerializeDeserialize + Debug + Default;
 
 	/// The opaque token type for an imbalance. This is returned by unbalanced operations
 	/// and must be dealt with. It may be dropped but cannot be cloned.
@@ -376,9 +556,7 @@ pub trait Currency<AccountId> {
 	/// This is the only balance that matters in terms of most operations on tokens. It alone
 	/// is used to determine the balance when in the contract execution environment. When this
 	/// balance falls below the value of `ExistentialDeposit`, then the 'current account' is
-	/// deleted: specifically `FreeBalance`. Further, the `OnFreeBalanceZero` callback
-	/// is invoked, giving a chance to external modules to clean up data associated with
-	/// the deleted account.
+	/// deleted: specifically `FreeBalance`.
 	///
 	/// `system::AccountNonce` is also deleted if `ReservedBalance` is also zero (it also gets
 	/// collapsed to zero if it ever becomes less than `ExistentialDeposit`.
@@ -496,10 +674,15 @@ pub trait Currency<AccountId> {
 	fn make_free_balance_be(
 		who: &AccountId,
 		balance: Self::Balance,
-	) -> (
-		SignedImbalance<Self::Balance, Self::PositiveImbalance>,
-		UpdateBalanceOutcome,
-	);
+	) -> SignedImbalance<Self::Balance, Self::PositiveImbalance>;
+}
+
+/// Status of funds.
+pub enum BalanceStatus {
+	/// Funds are free, as corresponding to `free` item in Balances.
+	Free,
+	/// Funds are reserved, as corresponding to `reserved` item in Balances.
+	Reserved,
 }
 
 /// A currency where funds can be reserved from the user.
@@ -530,7 +713,6 @@ pub trait ReservableCurrency<AccountId>: Currency<AccountId> {
 	/// collapsed to zero if it ever becomes less than `ExistentialDeposit`.
 	fn reserved_balance(who: &AccountId) -> Self::Balance;
 
-
 	/// Moves `value` from balance to reserved balance.
 	///
 	/// If the free balance is lower than `value`, then no funds will be moved and an `Err` will
@@ -549,16 +731,18 @@ pub trait ReservableCurrency<AccountId>: Currency<AccountId> {
 	/// invoke `on_reserved_too_low` and could reap the account.
 	fn unreserve(who: &AccountId, value: Self::Balance) -> Self::Balance;
 
-	/// Moves up to `value` from reserved balance of account `slashed` to free balance of account
+	/// Moves up to `value` from reserved balance of account `slashed` to balance of account
 	/// `beneficiary`. `beneficiary` must exist for this to succeed. If it does not, `Err` will be
-	/// returned.
+	/// returned. Funds will be placed in either the `free` balance or the `reserved` balance,
+	/// depending on the `status`.
 	///
 	/// As much funds up to `value` will be deducted as possible. If this is less than `value`,
 	/// then `Ok(non_zero)` will be returned.
 	fn repatriate_reserved(
 		slashed: &AccountId,
 		beneficiary: &AccountId,
-		value: Self::Balance
+		value: Self::Balance,
+		status: BalanceStatus,
 	) -> result::Result<Self::Balance, DispatchError>;
 }
 
@@ -581,7 +765,6 @@ pub trait LockableCurrency<AccountId>: Currency<AccountId> {
 		id: LockIdentifier,
 		who: &AccountId,
 		amount: Self::Balance,
-		until: Self::Moment,
 		reasons: WithdrawReasons,
 	);
 
@@ -592,13 +775,11 @@ pub trait LockableCurrency<AccountId>: Currency<AccountId> {
 	/// applies the most severe constraints of the two, while `set_lock` replaces the lock
 	/// with the new parameters. As in, `extend_lock` will set:
 	/// - maximum `amount`
-	/// - farthest duration (`until`)
 	/// - bitwise mask of all `reasons`
 	fn extend_lock(
 		id: LockIdentifier,
 		who: &AccountId,
 		amount: Self::Balance,
-		until: Self::Moment,
 		reasons: WithdrawReasons,
 	);
 
@@ -609,26 +790,37 @@ pub trait LockableCurrency<AccountId>: Currency<AccountId> {
 	);
 }
 
-/// A currency whose accounts can have balances which vest over time.
-pub trait VestingCurrency<AccountId>: Currency<AccountId> {
+/// A vesting schedule over a currency. This allows a particular currency to have vesting limits
+/// applied to it.
+pub trait VestingSchedule<AccountId> {
 	/// The quantity used to denote time; usually just a `BlockNumber`.
 	type Moment;
 
+	/// The currency that this schedule applies to.
+	type Currency: Currency<AccountId>;
+
 	/// Get the amount that is currently being vested and cannot be transferred out of this account.
-	fn vesting_balance(who: &AccountId) -> Self::Balance;
+	/// Returns `None` if the account has no vesting schedule.
+	fn vesting_balance(who: &AccountId) -> Option<<Self::Currency as Currency<AccountId>>::Balance>;
 
 	/// Adds a vesting schedule to a given account.
 	///
 	/// If there already exists a vesting schedule for the given account, an `Err` is returned
 	/// and nothing is updated.
+	///
+	/// Is a no-op if the amount to be vested is zero.
+	///
+	/// NOTE: This doesn't alter the free balance of the account.
 	fn add_vesting_schedule(
 		who: &AccountId,
-		locked: Self::Balance,
-		per_block: Self::Balance,
+		locked: <Self::Currency as Currency<AccountId>>::Balance,
+		per_block: <Self::Currency as Currency<AccountId>>::Balance,
 		starting_block: Self::Moment,
 	) -> DispatchResult;
 
 	/// Remove a vesting schedule for a given account.
+	///
+	/// NOTE: This doesn't alter the free balance of the account.
 	fn remove_vesting_schedule(who: &AccountId);
 }
 
@@ -644,7 +836,7 @@ bitmask! {
 		TransactionPayment = 0b00000001,
 		/// In order to transfer ownership.
 		Transfer = 0b00000010,
-		/// In order to reserve some funds for a later return or repatriation
+		/// In order to reserve some funds for a later return or repatriation.
 		Reserve = 0b00000100,
 		/// In order to pay some other (higher-level) fees.
 		Fee = 0b00001000,
@@ -654,7 +846,7 @@ bitmask! {
 }
 
 pub trait Time {
-	type Moment: SimpleArithmetic + Parameter + Default + Copy;
+	type Moment: AtLeast32Bit + Parameter + Default + Copy;
 
 	fn now() -> Self::Moment;
 }
@@ -682,6 +874,8 @@ impl WithdrawReasons {
 pub trait ChangeMembers<AccountId: Clone + Ord> {
 	/// A number of members `incoming` just joined the set and replaced some `outgoing` ones. The
 	/// new set is given by `new`, and need not be sorted.
+	///
+	/// This resets any previous value of prime.
 	fn change_members(incoming: &[AccountId], outgoing: &[AccountId], mut new: Vec<AccountId>) {
 		new.sort_unstable();
 		Self::change_members_sorted(incoming, outgoing, &new[..]);
@@ -691,6 +885,8 @@ pub trait ChangeMembers<AccountId: Clone + Ord> {
 	/// new set is thus given by `sorted_new` and **must be sorted**.
 	///
 	/// NOTE: This is the only function that needs to be implemented in `ChangeMembers`.
+	///
+	/// This resets any previous value of prime.
 	fn change_members_sorted(
 		incoming: &[AccountId],
 		outgoing: &[AccountId],
@@ -699,6 +895,8 @@ pub trait ChangeMembers<AccountId: Clone + Ord> {
 
 	/// Set the new members; they **must already be sorted**. This will compute the diff and use it to
 	/// call `change_members_sorted`.
+	///
+	/// This resets any previous value of prime.
 	fn set_members_sorted(new_members: &[AccountId], old_members: &[AccountId]) {
 		let (incoming, outgoing) = Self::compute_members_diff(new_members, old_members);
 		Self::change_members_sorted(&incoming[..], &outgoing[..], &new_members);
@@ -739,13 +937,19 @@ pub trait ChangeMembers<AccountId: Clone + Ord> {
 		}
 		(incoming, outgoing)
 	}
+
+	/// Set the prime member.
+	fn set_prime(_prime: Option<AccountId>) {}
 }
 
 impl<T: Clone + Ord> ChangeMembers<T> for () {
 	fn change_members(_: &[T], _: &[T], _: Vec<T>) {}
 	fn change_members_sorted(_: &[T], _: &[T], _: &[T]) {}
 	fn set_members_sorted(_: &[T], _: &[T]) {}
+	fn set_prime(_: Option<T>) {}
 }
+
+
 
 /// Trait for type that can handle the initialization of account IDs at genesis.
 pub trait InitializeMembers<AccountId> {
@@ -762,7 +966,10 @@ pub trait Randomness<Output> {
 	/// Get a "random" value
 	///
 	/// Being a deterministic blockchain, real randomness is difficult to come by. This gives you
-	/// something that approximates it. `subject` is a context identifier and allows you to get a
+	/// something that approximates it. At best, this will be randomness which was
+	/// hard to predict a long time ago, but that has become easy to predict recently.
+	///
+	/// `subject` is a context identifier and allows you to get a
 	/// different result to other callers of this function; use it like
 	/// `random(&b"my context"[..])`.
 	fn random(subject: &[u8]) -> Output;
@@ -801,4 +1008,31 @@ pub trait ModuleToIndex {
 
 impl ModuleToIndex for () {
 	fn module_to_index<M: 'static>() -> Option<usize> { Some(0) }
+}
+
+/// The function and pallet name of the Call.
+#[derive(Clone, Eq, PartialEq, Default, RuntimeDebug)]
+pub struct CallMetadata {
+	/// Name of the function.
+	pub function_name: &'static str,
+	/// Name of the pallet to which the function belongs.
+	pub pallet_name: &'static str,
+}
+
+/// Gets the function name of the Call.
+pub trait GetCallName {
+	/// Return all function names.
+	fn get_call_names() -> &'static [&'static str];
+	/// Return the function name of the Call.
+	fn get_call_name(&self) -> &'static str;
+}
+
+/// Gets the metadata for the Call - function name and pallet name.
+pub trait GetCallMetadata {
+	/// Return all module names.
+	fn get_module_names() -> &'static [&'static str];
+	/// Return all function names for the given `module`.
+	fn get_call_names(module: &str) -> &'static [&'static str];
+	/// Return a [`CallMetadata`], containing function and pallet name of the Call.
+	fn get_call_metadata(&self) -> CallMetadata;
 }

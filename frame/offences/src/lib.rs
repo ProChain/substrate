@@ -30,7 +30,7 @@ use frame_support::{
 };
 use sp_runtime::traits::Hash;
 use sp_staking::{
-	offence::{Offence, ReportOffence, Kind, OnOffenceHandler, OffenceDetails},
+	offence::{Offence, ReportOffence, Kind, OnOffenceHandler, OffenceDetails, OffenceError},
 };
 use codec::{Encode, Decode};
 use frame_system as system;
@@ -54,10 +54,12 @@ pub trait Trait: frame_system::Trait {
 decl_storage! {
 	trait Store for Module<T: Trait> as Offences {
 		/// The primary structure that holds all offence records keyed by report identifiers.
-		Reports get(fn reports): map ReportIdOf<T> => Option<OffenceDetails<T::AccountId, T::IdentificationTuple>>;
+		Reports get(fn reports): map hasher(blake2_256) ReportIdOf<T> => Option<OffenceDetails<T::AccountId, T::IdentificationTuple>>;
 
 		/// A vector of reports of the same kind that happened at the same time slot.
-		ConcurrentReportsIndex: double_map Kind, OpaqueTimeSlot => Vec<ReportIdOf<T>>;
+		ConcurrentReportsIndex:
+			double_map hasher(blake2_256) Kind, hasher(blake2_256) OpaqueTimeSlot
+			=> Vec<ReportIdOf<T>>;
 
 		/// Enumerates all reports of a kind along with the time they happened.
 		///
@@ -65,7 +67,7 @@ decl_storage! {
 		///
 		/// Note that the actual type of this mapping is `Vec<u8>`, this is because values of
 		/// different types are not supported at the moment so we are doing the manual serialization.
-		ReportsByKindIndex: map Kind => Vec<u8>; // (O::TimeSlot, ReportIdOf<T>)
+		ReportsByKindIndex: map hasher(blake2_256) Kind => Vec<u8>; // (O::TimeSlot, ReportIdOf<T>)
 	}
 }
 
@@ -88,7 +90,7 @@ impl<T: Trait, O: Offence<T::IdentificationTuple>>
 where
 	T::IdentificationTuple: Clone,
 {
-	fn report_offence(reporters: Vec<T::AccountId>, offence: O) {
+	fn report_offence(reporters: Vec<T::AccountId>, offence: O) -> Result<(), OffenceError> {
 		let offenders = offence.offenders();
 		let time_slot = offence.time_slot();
 		let validator_set_count = offence.validator_set_count();
@@ -102,7 +104,7 @@ where
 		) {
 			Some(triage) => triage,
 			// The report contained only duplicates, so there is no need to slash again.
-			None => return,
+			None => return Err(OffenceError::DuplicateReport),
 		};
 
 		// Deposit the event.
@@ -121,6 +123,8 @@ where
 			&slash_perbill,
 			offence.session_index(),
 		);
+
+		Ok(())
 	}
 }
 
@@ -148,7 +152,7 @@ impl<T: Trait> Module<T> {
 		for offender in offenders {
 			let report_id = Self::report_id::<O>(time_slot, &offender);
 
-			if !<Reports<T>>::exists(&report_id) {
+			if !<Reports<T>>::contains_key(&report_id) {
 				any_new = true;
 				<Reports<T>>::insert(
 					&report_id,
@@ -185,7 +189,7 @@ struct TriageOutcome<T: Trait> {
 	concurrent_offenders: Vec<OffenceDetails<T::AccountId, T::IdentificationTuple>>,
 }
 
-/// An auxilary struct for working with storage of indexes localized for a specific offence
+/// An auxiliary struct for working with storage of indexes localized for a specific offence
 /// kind (specified by the `O` type parameter).
 ///
 /// This struct is responsible for aggregating storage writes and the underlying storage should not

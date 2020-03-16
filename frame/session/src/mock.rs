@@ -21,8 +21,9 @@ use std::cell::RefCell;
 use frame_support::{impl_outer_origin, parameter_types, weights::Weight};
 use sp_core::{crypto::key_types::DUMMY, H256};
 use sp_runtime::{
-	Perbill, impl_opaque_keys, traits::{BlakeTwo256, IdentityLookup, ConvertInto},
-	testing::{Header, UintAuthorityId}
+	Perbill, impl_opaque_keys,
+	traits::{BlakeTwo256, IdentityLookup, ConvertInto},
+	testing::{Header, UintAuthorityId},
 };
 use sp_staking::SessionIndex;
 
@@ -88,9 +89,11 @@ impl SessionHandler<u64> for TestSessionHandler {
 	}
 }
 
-pub struct TestOnSessionEnding;
-impl OnSessionEnding<u64> for TestOnSessionEnding {
-	fn on_session_ending(_: SessionIndex, _: SessionIndex) -> Option<Vec<u64>> {
+pub struct TestSessionManager;
+impl SessionManager<u64> for TestSessionManager {
+	fn end_session(_: SessionIndex) {}
+	fn start_session(_: SessionIndex) {}
+	fn new_session(_: SessionIndex) -> Option<Vec<u64>> {
 		if !TEST_SESSION_CHANGED.with(|l| *l.borrow()) {
 			VALIDATORS.with(|v| {
 				let mut v = v.borrow_mut();
@@ -108,14 +111,14 @@ impl OnSessionEnding<u64> for TestOnSessionEnding {
 }
 
 #[cfg(feature = "historical")]
-impl crate::historical::OnSessionEnding<u64, u64> for TestOnSessionEnding {
-	fn on_session_ending(ending_index: SessionIndex, will_apply_at: SessionIndex)
-		-> Option<(Vec<u64>, Vec<(u64, u64)>)>
+impl crate::historical::SessionManager<u64, u64> for TestSessionManager {
+	fn end_session(_: SessionIndex) {}
+	fn start_session(_: SessionIndex) {}
+	fn new_session(new_index: SessionIndex)
+		-> Option<Vec<(u64, u64)>>
 	{
-		let pair_with_ids = |vals: &[u64]| vals.iter().map(|&v| (v, v)).collect::<Vec<_>>();
-		<Self as OnSessionEnding<_>>::on_session_ending(ending_index, will_apply_at)
-			.map(|vals| (pair_with_ids(&vals), vals))
-			.map(|(ids, vals)| (vals, ids))
+		<Self as SessionManager<_>>::new_session(new_index)
+			.map(|vals| vals.into_iter().map(|val| (val, val)).collect())
 	}
 }
 
@@ -175,6 +178,9 @@ impl frame_system::Trait for Test {
 	type MaximumBlockLength = MaximumBlockLength;
 	type Version = ();
 	type ModuleToIndex = ();
+	type AccountData = ();
+	type OnNewAccount = ();
+	type OnKilledAccount = ();
 }
 
 impl pallet_timestamp::Trait for Test {
@@ -190,15 +196,14 @@ parameter_types! {
 impl Trait for Test {
 	type ShouldEndSession = TestShouldEndSession;
 	#[cfg(feature = "historical")]
-	type OnSessionEnding = crate::historical::NoteHistoricalRoot<Test, TestOnSessionEnding>;
+	type SessionManager = crate::historical::NoteHistoricalRoot<Test, TestSessionManager>;
 	#[cfg(not(feature = "historical"))]
-	type OnSessionEnding = TestOnSessionEnding;
+	type SessionManager = TestSessionManager;
 	type SessionHandler = TestSessionHandler;
 	type ValidatorId = u64;
 	type ValidatorIdOf = ConvertInto;
 	type Keys = MockSessionKeys;
 	type Event = ();
-	type SelectInitialValidators = ();
 	type DisabledValidatorsThreshold = DisabledValidatorsThreshold;
 }
 

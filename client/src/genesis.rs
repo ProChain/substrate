@@ -45,7 +45,7 @@ mod tests {
 	use codec::{Encode, Decode, Joiner};
 	use sc_executor::native_executor_instance;
 	use sp_state_machine::{
-		StateMachine, OverlayedChanges, ExecutionStrategy, InMemoryChangesTrieStorage,
+		StateMachine, OverlayedChanges, ExecutionStrategy,
 		InMemoryBackend,
 	};
 	use substrate_test_runtime_client::{
@@ -53,21 +53,21 @@ mod tests {
 		runtime::{Hash, Transfer, Block, BlockNumber, Header, Digest},
 		AccountKeyring, Sr25519Keyring,
 	};
-	use sp_core::Blake2Hasher;
+	use sp_runtime::traits::BlakeTwo256;
 	use hex_literal::*;
 
 	native_executor_instance!(
 		Executor,
 		substrate_test_runtime_client::runtime::api::dispatch,
-		substrate_test_runtime_client::runtime::native_version
+		substrate_test_runtime_client::runtime::native_version,
 	);
 
 	fn executor() -> sc_executor::NativeExecutor<Executor> {
-		sc_executor::NativeExecutor::new(sc_executor::WasmExecutionMethod::Interpreted, None)
+		sc_executor::NativeExecutor::new(sc_executor::WasmExecutionMethod::Interpreted, None, 8)
 	}
 
 	fn construct_block(
-		backend: &InMemoryBackend<Blake2Hasher>,
+		backend: &InMemoryBackend<BlakeTwo256>,
 		number: BlockNumber,
 		parent_hash: Hash,
 		state_root: Hash,
@@ -78,7 +78,7 @@ mod tests {
 		let transactions = txs.into_iter().map(|tx| tx.into_signed_tx()).collect::<Vec<_>>();
 
 		let iter = transactions.iter().map(Encode::encode);
-		let extrinsics_root = Layout::<Blake2Hasher>::ordered_trie_root(iter).into();
+		let extrinsics_root = Layout::<BlakeTwo256>::ordered_trie_root(iter).into();
 
 		let mut header = Header {
 			parent_hash,
@@ -89,15 +89,18 @@ mod tests {
 		};
 		let hash = header.hash();
 		let mut overlay = OverlayedChanges::default();
+		let backend_runtime_code = sp_state_machine::backend::BackendRuntimeCode::new(&backend);
+		let runtime_code = backend_runtime_code.runtime_code().expect("Code is part of the backend");
 
 		StateMachine::new(
 			backend,
-			Some(&InMemoryChangesTrieStorage::<_, u64>::new()),
+			sp_state_machine::disabled_changes_trie_state::<_, u64>(),
 			&mut overlay,
 			&executor(),
 			"Core_initialize_block",
 			&header.encode(),
 			Default::default(),
+			&runtime_code,
 		).execute(
 			ExecutionStrategy::NativeElseWasm,
 		).unwrap();
@@ -105,12 +108,13 @@ mod tests {
 		for tx in transactions.iter() {
 			StateMachine::new(
 				backend,
-				Some(&InMemoryChangesTrieStorage::<_, u64>::new()),
+				sp_state_machine::disabled_changes_trie_state::<_, u64>(),
 				&mut overlay,
 				&executor(),
 				"BlockBuilder_apply_extrinsic",
 				&tx.encode(),
 				Default::default(),
+				&runtime_code,
 			).execute(
 				ExecutionStrategy::NativeElseWasm,
 			).unwrap();
@@ -118,12 +122,13 @@ mod tests {
 
 		let ret_data = StateMachine::new(
 			backend,
-			Some(&InMemoryChangesTrieStorage::<_, u64>::new()),
+			sp_state_machine::disabled_changes_trie_state::<_, u64>(),
 			&mut overlay,
 			&executor(),
 			"BlockBuilder_finalize_block",
 			&[],
 			Default::default(),
+			&runtime_code,
 		).execute(
 			ExecutionStrategy::NativeElseWasm,
 		).unwrap();
@@ -132,7 +137,7 @@ mod tests {
 		(vec![].and(&Block { header, extrinsics: transactions }), hash)
 	}
 
-	fn block1(genesis_hash: Hash, backend: &InMemoryBackend<Blake2Hasher>) -> (Vec<u8>, Hash) {
+	fn block1(genesis_hash: Hash, backend: &InMemoryBackend<BlakeTwo256>) -> (Vec<u8>, Hash) {
 		construct_block(
 			backend,
 			1,
@@ -150,7 +155,7 @@ mod tests {
 	#[test]
 	fn construct_genesis_should_work_with_native() {
 		let mut storage = GenesisConfig::new(
-			false,
+			None,
 			vec![Sr25519Keyring::One.public().into(), Sr25519Keyring::Two.public().into()],
 			vec![AccountKeyring::One.into(), AccountKeyring::Two.into()],
 			1000,
@@ -161,16 +166,19 @@ mod tests {
 
 		let backend = InMemoryBackend::from(storage);
 		let (b1data, _b1hash) = block1(genesis_hash, &backend);
+		let backend_runtime_code = sp_state_machine::backend::BackendRuntimeCode::new(&backend);
+		let runtime_code = backend_runtime_code.runtime_code().expect("Code is part of the backend");
 
 		let mut overlay = OverlayedChanges::default();
 		let _ = StateMachine::new(
 			&backend,
-			Some(&InMemoryChangesTrieStorage::<_, u64>::new()),
+			sp_state_machine::disabled_changes_trie_state::<_, u64>(),
 			&mut overlay,
 			&executor(),
 			"Core_execute_block",
 			&b1data,
 			Default::default(),
+			&runtime_code,
 		).execute(
 			ExecutionStrategy::NativeElseWasm,
 		).unwrap();
@@ -178,7 +186,7 @@ mod tests {
 
 	#[test]
 	fn construct_genesis_should_work_with_wasm() {
-		let mut storage = GenesisConfig::new(false,
+		let mut storage = GenesisConfig::new(None,
 			vec![Sr25519Keyring::One.public().into(), Sr25519Keyring::Two.public().into()],
 			vec![AccountKeyring::One.into(), AccountKeyring::Two.into()],
 			1000,
@@ -189,16 +197,19 @@ mod tests {
 
 		let backend = InMemoryBackend::from(storage);
 		let (b1data, _b1hash) = block1(genesis_hash, &backend);
+		let backend_runtime_code = sp_state_machine::backend::BackendRuntimeCode::new(&backend);
+		let runtime_code = backend_runtime_code.runtime_code().expect("Code is part of the backend");
 
 		let mut overlay = OverlayedChanges::default();
 		let _ = StateMachine::new(
 			&backend,
-			Some(&InMemoryChangesTrieStorage::<_, u64>::new()),
+			sp_state_machine::disabled_changes_trie_state::<_, u64>(),
 			&mut overlay,
 			&executor(),
 			"Core_execute_block",
 			&b1data,
 			Default::default(),
+			&runtime_code,
 		).execute(
 			ExecutionStrategy::AlwaysWasm,
 		).unwrap();
@@ -206,7 +217,7 @@ mod tests {
 
 	#[test]
 	fn construct_genesis_with_bad_transaction_should_panic() {
-		let mut storage = GenesisConfig::new(false,
+		let mut storage = GenesisConfig::new(None,
 			vec![Sr25519Keyring::One.public().into(), Sr25519Keyring::Two.public().into()],
 			vec![AccountKeyring::One.into(), AccountKeyring::Two.into()],
 			68,
@@ -217,16 +228,19 @@ mod tests {
 
 		let backend = InMemoryBackend::from(storage);
 		let (b1data, _b1hash) = block1(genesis_hash, &backend);
+		let backend_runtime_code = sp_state_machine::backend::BackendRuntimeCode::new(&backend);
+		let runtime_code = backend_runtime_code.runtime_code().expect("Code is part of the backend");
 
 		let mut overlay = OverlayedChanges::default();
 		let r = StateMachine::new(
 			&backend,
-			Some(&InMemoryChangesTrieStorage::<_, u64>::new()),
+			sp_state_machine::disabled_changes_trie_state::<_, u64>(),
 			&mut overlay,
 			&executor(),
 			"Core_execute_block",
 			&b1data,
 			Default::default(),
+			&runtime_code,
 		).execute(
 			ExecutionStrategy::NativeElseWasm,
 		);

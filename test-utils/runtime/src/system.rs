@@ -35,7 +35,7 @@ use frame_system::Trait;
 use crate::{
 	AccountId, BlockNumber, Extrinsic, Transfer, H256 as Hash, Block, Header, Digest, AuthorityId
 };
-use sp_core::storage::well_known_keys;
+use sp_core::{storage::well_known_keys, ChangesTrieConfiguration};
 
 const NONCE_OF: &[u8] = b"nonce:";
 const BALANCE_OF: &[u8] = b"balance:";
@@ -46,11 +46,12 @@ decl_module! {
 
 decl_storage! {
 	trait Store for Module<T: Trait> as TestRuntime {
-		ExtrinsicData: map u32 => Vec<u8>;
+		ExtrinsicData: map hasher(blake2_256) u32 => Vec<u8>;
 		// The current block number being processed. Set by `execute_block`.
 		Number get(fn number): Option<BlockNumber>;
 		ParentHash get(fn parent_hash): Hash;
 		NewAuthorities get(fn new_authorities): Option<Vec<AuthorityId>>;
+		NewChangesTrieConfig get(fn new_changes_trie_config): Option<Option<ChangesTrieConfiguration>>;
 		StorageDigest get(fn storage_digest): Option<Digest>;
 		Authorities get(fn authorities) config(): Vec<AuthorityId>;
 	}
@@ -190,7 +191,7 @@ pub fn validate_transaction(utx: Extrinsic) -> TransactionValidity {
 /// This doesn't attempt to validate anything regarding the block.
 pub fn execute_transaction(utx: Extrinsic) -> ApplyExtrinsicResult {
 	let extrinsic_index: u32 = storage::unhashed::get(well_known_keys::EXTRINSIC_INDEX).unwrap();
-	let result = execute_transaction_backend(&utx);
+	let result = execute_transaction_backend(&utx, extrinsic_index);
 	ExtrinsicData::insert(extrinsic_index, utx.encode());
 	storage::unhashed::put(well_known_keys::EXTRINSIC_INDEX, &(extrinsic_index + 1));
 	result
@@ -206,6 +207,8 @@ pub fn finalize_block() -> Header {
 	let mut digest = <StorageDigest>::take().expect("StorageDigest is set by `initialize_block`");
 
 	let o_new_authorities = <NewAuthorities>::take();
+	let new_changes_trie_config = <NewChangesTrieConfig>::take();
+
 	// This MUST come after all changes to storage are done. Otherwise we will fail the
 	// “Storage root does not match that calculated” assertion.
 	let storage_root = Hash::decode(&mut &storage_root()[..])
@@ -222,12 +225,18 @@ pub fn finalize_block() -> Header {
 		digest.push(generic::DigestItem::Consensus(*b"babe", new_authorities.encode()));
 	}
 
+	if let Some(new_config) = new_changes_trie_config {
+		digest.push(generic::DigestItem::ChangesTrieSignal(
+			generic::ChangesTrieSignal::NewConfiguration(new_config)
+		));
+	}
+
 	Header {
 		number,
 		extrinsics_root,
 		state_root: storage_root,
 		parent_hash,
-		digest: digest,
+		digest,
 	}
 }
 
@@ -237,13 +246,20 @@ fn check_signature(utx: &Extrinsic) -> Result<(), TransactionValidityError> {
 	utx.clone().check().map_err(|_| InvalidTransaction::BadProof.into()).map(|_| ())
 }
 
-fn execute_transaction_backend(utx: &Extrinsic) -> ApplyExtrinsicResult {
+fn execute_transaction_backend(utx: &Extrinsic, extrinsic_index: u32) -> ApplyExtrinsicResult {
 	check_signature(utx)?;
 	match utx {
-		Extrinsic::Transfer(ref transfer, _) => execute_transfer_backend(transfer),
-		Extrinsic::AuthoritiesChange(ref new_auth) => execute_new_authorities_backend(new_auth),
+		Extrinsic::Transfer { exhaust_resources_when_not_first: true, .. } if extrinsic_index != 0 =>
+			Err(InvalidTransaction::ExhaustsResources.into()),
+		Extrinsic::Transfer { ref transfer, .. } =>
+			execute_transfer_backend(transfer),
+		Extrinsic::AuthoritiesChange(ref new_auth) =>
+			execute_new_authorities_backend(new_auth),
 		Extrinsic::IncludeData(_) => Ok(Ok(())),
-		Extrinsic::StorageChange(key, value) => execute_storage_change(key, value.as_ref().map(|v| &**v)),
+		Extrinsic::StorageChange(key, value) =>
+			execute_storage_change(key, value.as_ref().map(|v| &**v)),
+		Extrinsic::ChangesTrieConfigUpdate(ref new_config) =>
+			execute_changes_trie_config_update(new_config.clone()),
 	}
 }
 
@@ -286,6 +302,18 @@ fn execute_storage_change(key: &[u8], value: Option<&[u8]>) -> ApplyExtrinsicRes
 	Ok(Ok(()))
 }
 
+fn execute_changes_trie_config_update(new_config: Option<ChangesTrieConfiguration>) -> ApplyExtrinsicResult {
+	match new_config.clone() {
+		Some(new_config) => storage::unhashed::put_raw(
+			well_known_keys::CHANGES_TRIE_CONFIG,
+			&new_config.encode(),
+		),
+		None => storage::unhashed::kill(well_known_keys::CHANGES_TRIE_CONFIG),
+	}
+	<NewChangesTrieConfig>::put(new_config);
+	Ok(Ok(()))
+}
+
 #[cfg(feature = "std")]
 fn info_expect_equal_hash(given: &Hash, expected: &Hash) {
 	use sp_core::hexdisplay::HexDisplay;
@@ -314,7 +342,7 @@ mod tests {
 	use sp_io::TestExternalities;
 	use substrate_test_runtime_client::{AccountKeyring, Sr25519Keyring};
 	use crate::{Header, Transfer, WASM_BINARY};
-	use sp_core::{NeverNativeValue, map, traits::CodeExecutor};
+	use sp_core::{NeverNativeValue, map, traits::{CodeExecutor, RuntimeCode}};
 	use sc_executor::{NativeExecutor, WasmExecutionMethod, native_executor_instance};
 	use sp_io::hashing::twox_128;
 
@@ -326,7 +354,7 @@ mod tests {
 	);
 
 	fn executor() -> NativeExecutor<NativeDispatch> {
-		NativeExecutor::new(WasmExecutionMethod::Interpreted, None)
+		NativeExecutor::new(WasmExecutionMethod::Interpreted, None, 8)
 	}
 
 	fn new_test_ext() -> TestExternalities {
@@ -377,8 +405,15 @@ mod tests {
 	fn block_import_works_wasm() {
 		block_import_works(|b, ext| {
 			let mut ext = ext.ext();
-			executor().call::<_, NeverNativeValue, fn() -> _>(
+			let runtime_code = RuntimeCode {
+				code_fetcher: &sp_core::traits::WrappedRuntimeCode(WASM_BINARY.into()),
+				hash: Vec::new(),
+				heap_pages: None,
+			};
+
+			executor().call::<NeverNativeValue, fn() -> _>(
 				&mut ext,
+				&runtime_code,
 				"Core_execute_block",
 				&b.encode(),
 				false,
@@ -470,8 +505,15 @@ mod tests {
 	fn block_import_with_transaction_works_wasm() {
 		block_import_with_transaction_works(|b, ext| {
 			let mut ext = ext.ext();
-			executor().call::<_, NeverNativeValue, fn() -> _>(
+			let runtime_code = RuntimeCode {
+				code_fetcher: &sp_core::traits::WrappedRuntimeCode(WASM_BINARY.into()),
+				hash: Vec::new(),
+				heap_pages: None,
+			};
+
+			executor().call::<NeverNativeValue, fn() -> _>(
 				&mut ext,
+				&runtime_code,
 				"Core_execute_block",
 				&b.encode(),
 				false,

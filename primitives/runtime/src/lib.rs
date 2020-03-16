@@ -53,6 +53,9 @@ pub mod testing;
 pub mod traits;
 pub mod transaction_validity;
 pub mod random_number_generator;
+mod runtime_string;
+
+pub use crate::runtime_string::*;
 
 /// Re-export these since they're only "kind of" generic.
 pub use generic::{DigestItem, Digest};
@@ -65,7 +68,7 @@ pub use sp_application_crypto::{RuntimeAppPublic, BoundToRuntimeAppPublic};
 pub use sp_core::RuntimeDebug;
 
 /// Re-export top-level arithmetic stuff.
-pub use sp_arithmetic::{Perquintill, Perbill, Permill, Percent, Rational128, Fixed64};
+pub use sp_arithmetic::{Perquintill, Perbill, Permill, Percent, Rational128, Fixed64, PerThing};
 /// Re-export 128 bit helpers.
 pub use sp_arithmetic::helpers_128bit;
 /// Re-export big_uint stuff.
@@ -92,34 +95,13 @@ impl TypeId for ModuleId {
 	const TYPE_ID: [u8; 4] = *b"modl";
 }
 
-/// A String that is a `&'static str` on `no_std` and a `Cow<'static, str>` on `std`.
-#[cfg(feature = "std")]
-pub type RuntimeString = std::borrow::Cow<'static, str>;
-/// A String that is a `&'static str` on `no_std` and a `Cow<'static, str>` on `std`.
-#[cfg(not(feature = "std"))]
-pub type RuntimeString = &'static str;
-
-/// Create a const [`RuntimeString`].
-#[cfg(feature = "std")]
-#[macro_export]
-macro_rules! create_runtime_str {
-	( $y:expr ) => {{ std::borrow::Cow::Borrowed($y) }}
-}
-
-/// Create a const [`RuntimeString`].
-#[cfg(not(feature = "std"))]
-#[macro_export]
-macro_rules! create_runtime_str {
-	( $y:expr ) => {{ $y }}
-}
-
 #[cfg(feature = "std")]
 pub use serde::{Serialize, Deserialize, de::DeserializeOwned};
 use crate::traits::IdentifyAccount;
 
 /// Complex storage builder stuff.
 #[cfg(feature = "std")]
-pub trait BuildStorage: Sized {
+pub trait BuildStorage {
 	/// Build the storage out of this builder.
 	fn build_storage(&self) -> Result<sp_core::storage::Storage, String> {
 		let mut storage = Default::default();
@@ -232,7 +214,7 @@ impl Default for MultiSigner {
 	}
 }
 
-/// NOTE: This implementations is required by `SimpleAddressDeterminator`,
+/// NOTE: This implementations is required by `SimpleAddressDeterminer`,
 /// we convert the hash into some AccountId, it's fine to use any scheme.
 impl<T: Into<H256>> crypto::UncheckedFrom<T> for MultiSigner {
 	fn unchecked_from(x: T) -> Self {
@@ -256,9 +238,7 @@ impl traits::IdentifyAccount for MultiSigner {
 		match self {
 			MultiSigner::Ed25519(who) => <[u8; 32]>::from(who).into(),
 			MultiSigner::Sr25519(who) => <[u8; 32]>::from(who).into(),
-			MultiSigner::Ecdsa(who) => sp_io::hashing::blake2_256(
-				&who.as_compressed().expect("`who` is a valid `ECDSA` public key; qed")[..],
-			).into(),
+			MultiSigner::Ecdsa(who) => sp_io::hashing::blake2_256(&who.as_ref()[..]).into(),
 		}
 	}
 }
@@ -425,13 +405,13 @@ impl From<&'static str> for DispatchError {
 	}
 }
 
-impl Into<&'static str> for DispatchError {
-	fn into(self) -> &'static str {
-		match self {
-			Self::Other(msg) => msg,
-			Self::CannotLookup => "Can not lookup",
-			Self::BadOrigin => "Bad origin",
-			Self::Module { message, .. } => message.unwrap_or("Unknown module error"),
+impl From<DispatchError> for &'static str {
+	fn from(err: DispatchError) -> &'static str {
+		match err {
+			DispatchError::Other(msg) => msg,
+			DispatchError::CannotLookup => "Can not lookup",
+			DispatchError::BadOrigin => "Bad origin",
+			DispatchError::Module { message, .. } => message.unwrap_or("Unknown module error"),
 		}
 	}
 }
@@ -478,7 +458,7 @@ pub type DispatchOutcome = Result<(), DispatchError>;
 ///
 /// Examples of reasons preventing inclusion in a block:
 /// - More block weight is required to process the extrinsic than is left in the block being built.
-///   This doesn't neccessarily mean that the extrinsic is invalid, since it can still be
+///   This doesn't necessarily mean that the extrinsic is invalid, since it can still be
 ///   included in the next block if it has enough spare weight available.
 /// - The sender doesn't have enough funds to pay the transaction inclusion fee. Including such
 ///   a transaction in the block doesn't make sense.
@@ -659,6 +639,13 @@ macro_rules! assert_eq_error_rate {
 #[derive(PartialEq, Eq, Clone, Default, Encode, Decode)]
 pub struct OpaqueExtrinsic(pub Vec<u8>);
 
+#[cfg(feature = "std")]
+impl parity_util_mem::MallocSizeOf for OpaqueExtrinsic {
+	fn size_of(&self, ops: &mut parity_util_mem::MallocSizeOfOps) -> usize {
+		self.0.size_of(ops)
+	}
+}
+
 impl sp_std::fmt::Debug for OpaqueExtrinsic {
 	#[cfg(feature = "std")]
 	fn fmt(&self, fmt: &mut sp_std::fmt::Formatter) -> sp_std::fmt::Result {
@@ -742,7 +729,7 @@ mod tests {
 		let multi_signer = MultiSigner::from(pair.public());
 		assert!(multi_sig.verify(msg, &multi_signer.into_account()));
 
-		let multi_signer = MultiSigner::from(pair.public().into_compressed().unwrap());
+		let multi_signer = MultiSigner::from(pair.public());
 		assert!(multi_sig.verify(msg, &multi_signer.into_account()));
 	}
 }

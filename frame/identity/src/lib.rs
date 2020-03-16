@@ -73,10 +73,14 @@ use sp_runtime::{DispatchResult, RuntimeDebug};
 use sp_runtime::traits::{StaticLookup, EnsureOrigin, Zero, AppendZerosInput};
 use frame_support::{
 	decl_module, decl_event, decl_storage, ensure, decl_error,
-	traits::{Currency, ReservableCurrency, OnUnbalanced, Get},
+	traits::{Currency, ReservableCurrency, OnUnbalanced, Get, BalanceStatus},
 	weights::SimpleDispatchInfo,
 };
 use frame_system::{self as system, ensure_signed, ensure_root};
+
+#[cfg(feature = "runtime-benchmarks")]
+pub mod benchmarking;
+mod migration;
 
 type BalanceOf<T> = <<T as Trait>::Currency as Currency<<T as frame_system::Trait>::AccountId>>::Balance;
 type NegativeImbalanceOf<T> = <<T as Trait>::Currency as Currency<<T as frame_system::Trait>::AccountId>>::NegativeImbalance;
@@ -100,7 +104,11 @@ pub trait Trait: frame_system::Trait {
 	type SubAccountDeposit: Get<BalanceOf<Self>>;
 
 	/// The maximum number of sub-accounts allowed per identified account.
-	type MaximumSubAccounts: Get<u32>;
+	type MaxSubAccounts: Get<u32>;
+
+	/// Maximum number of additional fields that may be stored in an ID. Needed to bound the I/O
+	/// required to access an identity, but can be pretty high.
+	type MaxAdditionalFields: Get<u32>;
 
 	/// What to do with slashed funds.
 	type Slashed: OnUnbalanced<NegativeImbalanceOf<Self>>;
@@ -375,18 +383,21 @@ pub struct RegistrarInfo<
 }
 
 decl_storage! {
-	trait Store for Module<T: Trait> as Sudo {
+	trait Store for Module<T: Trait> as Identity {
 		/// Information that is pertinent to identify the entity behind an account.
-		pub IdentityOf get(fn identity): map T::AccountId => Option<Registration<BalanceOf<T>>>;
+		pub IdentityOf get(fn identity):
+			map hasher(blake2_256) T::AccountId => Option<Registration<BalanceOf<T>>>;
 
 		/// The super-identity of an alternative "sub" identity together with its name, within that
 		/// context. If the account is not some other account's sub-identity, then just `None`.
-		pub SuperOf get(fn super_of): map T::AccountId => Option<(T::AccountId, Data)>;
+		pub SuperOf get(fn super_of):
+			map hasher(blake2_256) T::AccountId => Option<(T::AccountId, Data)>;
 
 		/// Alternative "sub" identities of this account.
 		///
 		/// The first item is the deposit, the second is a vector of the accounts.
-		pub SubsOf get(fn subs): map T::AccountId => (BalanceOf<T>, Vec<T::AccountId>);
+		pub SubsOf get(fn subs_of):
+			map hasher(blake2_256) T::AccountId => (BalanceOf<T>, Vec<T::AccountId>);
 
 		/// The set of registrars. Not expected to get very big as can only be added through a
 		/// special origin (likely a council motion).
@@ -440,7 +451,9 @@ decl_error! {
 		InvalidIndex,
 		/// The target is invalid.
 		InvalidTarget,
-	}
+		/// Too many additional fields.
+		TooManyFields,
+}
 }
 
 decl_module! {
@@ -490,15 +503,17 @@ decl_module! {
 		/// Emits `IdentitySet` if successful.
 		///
 		/// # <weight>
-		/// - `O(X + R)` where `X` additional-field-count (deposit-bounded).
+		/// - `O(X + X' + R)` where `X` additional-field-count (deposit-bounded and code-bounded).
 		/// - At most two balance operations.
-		/// - One storage mutation (codec `O(X + R)`).
+		/// - One storage mutation (codec-read `O(X' + R)`, codec-write `O(X + R)`).
 		/// - One event.
 		/// # </weight>
 		#[weight = SimpleDispatchInfo::FixedNormal(50_000)]
 		fn set_identity(origin, info: IdentityInfo) {
 			let sender = ensure_signed(origin)?;
-			let fd = <BalanceOf<T>>::from(info.additional.len() as u32) * T::FieldDeposit::get();
+			let extra_fields = info.additional.len() as u32;
+			ensure!(extra_fields <= T::MaxAdditionalFields::get(), Error::<T>::TooManyFields);
+			let fd = <BalanceOf<T>>::from(extra_fields) * T::FieldDeposit::get();
 
 			let mut id = match <IdentityOf<T>>::get(&sender) {
 				Some(mut id) => {
@@ -542,8 +557,8 @@ decl_module! {
 		#[weight = SimpleDispatchInfo::FixedNormal(50_000)]
 		fn set_subs(origin, subs: Vec<(T::AccountId, Data)>) {
 			let sender = ensure_signed(origin)?;
-			ensure!(<IdentityOf<T>>::exists(&sender), Error::<T>::NotFound);
-			ensure!(subs.len() <= T::MaximumSubAccounts::get() as usize, Error::<T>::TooManySubAccounts);
+			ensure!(<IdentityOf<T>>::contains_key(&sender), Error::<T>::NotFound);
+			ensure!(subs.len() <= T::MaxSubAccounts::get() as usize, Error::<T>::TooManySubAccounts);
 
 			let (old_deposit, old_ids) = <SubsOf<T>>::get(&sender);
 			let new_deposit = T::SubAccountDeposit::get() * <BalanceOf<T>>::from(subs.len() as u32);
@@ -614,7 +629,7 @@ decl_module! {
 		/// - `max_fee`: The maximum fee that may be paid. This should just be auto-populated as:
 		///
 		/// ```nocompile
-		/// Self::registrars(reg_index).uwnrap().fee
+		/// Self::registrars(reg_index).unwrap().fee
 		/// ```
 		///
 		/// Emits `JudgementRequested` if successful.
@@ -810,7 +825,7 @@ decl_module! {
 			match id.judgements.binary_search_by_key(&reg_index, |x| x.0) {
 				Ok(position) => {
 					if let Judgement::FeePaid(fee) = id.judgements[position].1 {
-						let _ = T::Currency::repatriate_reserved(&target, &sender, fee);
+						let _ = T::Currency::repatriate_reserved(&target, &sender, fee, BalanceStatus::Free);
 					}
 					id.judgements[position] = item
 				}
@@ -839,7 +854,7 @@ decl_module! {
 		/// - `S + 2` storage mutations.
 		/// - One event.
 		/// # </weight>
-		#[weight = SimpleDispatchInfo::FreeOperational]
+		#[weight = SimpleDispatchInfo::FixedNormal(100_000)]
 		fn kill_identity(origin, target: <T::Lookup as StaticLookup>::Source) {
 			T::ForceOrigin::try_origin(origin)
 				.map(|_| ())
@@ -859,6 +874,20 @@ decl_module! {
 
 			Self::deposit_event(RawEvent::IdentityKilled(target, deposit));
 		}
+
+		fn on_runtime_upgrade() {
+			migration::on_runtime_upgrade::<T>()
+		}
+	}
+}
+
+impl<T: Trait> Module<T> {
+	/// Get the subs of an account.
+	pub fn subs(who: &T::AccountId) -> Vec<(T::AccountId, Data)> {
+		SubsOf::<T>::get(who).1
+			.into_iter()
+			.filter_map(|a| SuperOf::<T>::get(&a).map(|x| (a, x.1)))
+			.collect()
 	}
 }
 
@@ -869,7 +898,7 @@ mod tests {
 	use sp_runtime::traits::BadOrigin;
 	use frame_support::{
 		assert_ok, assert_noop, impl_outer_origin, parameter_types, weights::Weight,
-		ord_parameter_types
+		ord_parameter_types,
 	};
 	use sp_core::H256;
 	use frame_system::EnsureSignedBy;
@@ -883,9 +912,9 @@ mod tests {
 		pub enum Origin for Test  where system = frame_system {}
 	}
 
-	// For testing the module, we construct most of a mock runtime. This means
+	// For testing the pallet, we construct most of a mock runtime. This means
 	// first constructing a configuration type (`Test`) which `impl`s each of the
-	// configuration traits of modules we want to use.
+	// configuration traits of pallets we want to use.
 	#[derive(Clone, Eq, PartialEq)]
 	pub struct Test;
 	parameter_types! {
@@ -911,29 +940,26 @@ mod tests {
 		type AvailableBlockRatio = AvailableBlockRatio;
 		type Version = ();
 		type ModuleToIndex = ();
+		type AccountData = pallet_balances::AccountData<u64>;
+		type OnNewAccount = ();
+		type OnKilledAccount = ();
 	}
 	parameter_types! {
-		pub const ExistentialDeposit: u64 = 0;
-		pub const TransferFee: u64 = 0;
-		pub const CreationFee: u64 = 0;
+		pub const ExistentialDeposit: u64 = 1;
 	}
 	impl pallet_balances::Trait for Test {
 		type Balance = u64;
-		type OnFreeBalanceZero = ();
-		type OnReapAccount = System;
-		type OnNewAccount = ();
 		type Event = ();
-		type TransferPayment = ();
 		type DustRemoval = ();
 		type ExistentialDeposit = ExistentialDeposit;
-		type TransferFee = TransferFee;
-		type CreationFee = CreationFee;
+		type AccountStore = System;
 	}
 	parameter_types! {
 		pub const BasicDeposit: u64 = 10;
 		pub const FieldDeposit: u64 = 10;
 		pub const SubAccountDeposit: u64 = 10;
-		pub const MaximumSubAccounts: u32 = 2;
+		pub const MaxSubAccounts: u32 = 2;
+		pub const MaxAdditionalFields: u32 = 2;
 	}
 	ord_parameter_types! {
 		pub const One: u64 = 1;
@@ -946,7 +972,8 @@ mod tests {
 		type BasicDeposit = BasicDeposit;
 		type FieldDeposit = FieldDeposit;
 		type SubAccountDeposit = SubAccountDeposit;
-		type MaximumSubAccounts = MaximumSubAccounts;
+		type MaxSubAccounts = MaxSubAccounts;
+		type MaxAdditionalFields = MaxAdditionalFields;
 		type RegistrarOrigin = EnsureSignedBy<One, u64>;
 		type ForceOrigin = EnsureSignedBy<Two, u64>;
 	}
@@ -968,7 +995,6 @@ mod tests {
 				(20, 100),
 				(30, 100),
 			],
-			vesting: vec![],
 		}.assimilate_storage(&mut t).unwrap();
 		t.into()
 	}
@@ -1009,6 +1035,14 @@ mod tests {
 		new_test_ext().execute_with(|| {
 			assert_ok!(Identity::add_registrar(Origin::signed(1), 3));
 			assert_ok!(Identity::set_fee(Origin::signed(3), 0, 10));
+			let mut three_fields = ten();
+			three_fields.additional.push(Default::default());
+			three_fields.additional.push(Default::default());
+			three_fields.additional.push(Default::default());
+			assert_noop!(
+				Identity::set_identity(Origin::signed(10), three_fields),
+				Error::<Test>::TooManyFields
+			);
 			assert_ok!(Identity::set_identity(Origin::signed(10), ten()));
 			assert_eq!(Identity::identity(10).unwrap().info, ten());
 			assert_eq!(Balances::free_balance(10), 90);
@@ -1079,14 +1113,14 @@ mod tests {
 			assert_ok!(Identity::set_identity(Origin::signed(10), ten()));
 			assert_ok!(Identity::set_subs(Origin::signed(10), subs.clone()));
 			assert_eq!(Balances::free_balance(10), 80);
-			assert_eq!(Identity::subs(10), (10, vec![20]));
+			assert_eq!(Identity::subs_of(10), (10, vec![20]));
 			assert_eq!(Identity::super_of(20), Some((10, Data::Raw(vec![40; 1]))));
 
 			// push another item and re-set it.
 			subs.push((30, Data::Raw(vec![50; 1])));
 			assert_ok!(Identity::set_subs(Origin::signed(10), subs.clone()));
 			assert_eq!(Balances::free_balance(10), 70);
-			assert_eq!(Identity::subs(10), (20, vec![20, 30]));
+			assert_eq!(Identity::subs_of(10), (20, vec![20, 30]));
 			assert_eq!(Identity::super_of(20), Some((10, Data::Raw(vec![40; 1]))));
 			assert_eq!(Identity::super_of(30), Some((10, Data::Raw(vec![50; 1]))));
 
@@ -1094,7 +1128,7 @@ mod tests {
 			subs[0] = (40, Data::Raw(vec![60; 1]));
 			assert_ok!(Identity::set_subs(Origin::signed(10), subs.clone()));
 			assert_eq!(Balances::free_balance(10), 70); // no change in the balance
-			assert_eq!(Identity::subs(10), (20, vec![40, 30]));
+			assert_eq!(Identity::subs_of(10), (20, vec![40, 30]));
 			assert_eq!(Identity::super_of(20), None);
 			assert_eq!(Identity::super_of(30), Some((10, Data::Raw(vec![50; 1]))));
 			assert_eq!(Identity::super_of(40), Some((10, Data::Raw(vec![60; 1]))));
@@ -1102,7 +1136,7 @@ mod tests {
 			// clear
 			assert_ok!(Identity::set_subs(Origin::signed(10), vec![]));
 			assert_eq!(Balances::free_balance(10), 90);
-			assert_eq!(Identity::subs(10), (0, vec![]));
+			assert_eq!(Identity::subs_of(10), (0, vec![]));
 			assert_eq!(Identity::super_of(30), None);
 			assert_eq!(Identity::super_of(40), None);
 

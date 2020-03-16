@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
 
-//! SRML module that tracks the last finalized block, as perceived by block authors.
+//! FRAME Pallet that tracks the last finalized block, as perceived by block authors.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -25,6 +25,8 @@ use frame_support::{decl_module, decl_storage, decl_error, ensure};
 use frame_support::traits::Get;
 use frame_system::{ensure_none, Trait as SystemTrait};
 use sp_finality_tracker::{INHERENT_IDENTIFIER, FinalizedInherentData};
+
+mod migration;
 
 pub const DEFAULT_WINDOW_SIZE: u32 = 101;
 pub const DEFAULT_REPORT_LATENCY: u32 = 1000;
@@ -40,7 +42,7 @@ pub trait Trait: SystemTrait {
 }
 
 decl_storage! {
-	trait Store for Module<T: Trait> as Timestamp {
+	trait Store for Module<T: Trait> as FinalityTracker {
 		/// Recent hints.
 		RecentHints get(fn recent_hints) build(|_| vec![T::BlockNumber::zero()]): Vec<T::BlockNumber>;
 		/// Ordered recent hints.
@@ -88,6 +90,10 @@ decl_module! {
 
 		fn on_finalize() {
 			Self::update_hint(<Self as Store>::Update::take())
+		}
+
+		fn on_runtime_upgrade() {
+			migration::on_runtime_upgrade::<T>()
 		}
 	}
 }
@@ -261,6 +267,9 @@ mod tests {
 		type MaximumBlockLength = MaximumBlockLength;
 		type Version = ();
 		type ModuleToIndex = ();
+		type AccountData = ();
+		type OnNewAccount = ();
+		type OnKilledAccount = ();
 	}
 	parameter_types! {
 		pub const WindowSize: u64 = 11;

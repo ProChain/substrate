@@ -22,7 +22,7 @@ use codec::{Encode, Decode};
 use num_traits::Zero;
 
 /// Substrate changes trie configuration.
-#[cfg_attr(any(feature = "std", test), derive(Serialize, Deserialize))]
+#[cfg_attr(any(feature = "std", test), derive(Serialize, Deserialize, parity_util_mem::MallocSizeOf))]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Encode, Decode)]
 pub struct ChangesTrieConfiguration {
 	/// Interval (in blocks) at which level1-digests are created. Digests are not
@@ -36,6 +36,17 @@ pub struct ChangesTrieConfiguration {
 	/// && maximal digests interval will be truncated to the last interval that fits
 	/// `u32` limits.
 	pub digest_levels: u32,
+}
+
+/// Substrate changes trie configuration range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangesTrieConfigurationRange<Number, Hash> {
+	/// Zero block of configuration.
+	pub zero: (Number, Hash),
+	/// Last block of configuration (if configuration has been deactivated at some point).
+	pub end: Option<(Number, Hash)>,
+	/// The configuration itself. None if changes tries were disabled in this range.
+	pub config: Option<ChangesTrieConfiguration>,
 }
 
 impl ChangesTrieConfiguration {

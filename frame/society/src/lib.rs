@@ -228,6 +228,7 @@
 //! * `defender_vote` - A member can vote to approve or reject a defender's continued membership
 //! to the society.
 //! * `payout` - A member can claim their first matured payment.
+//! * `unfound` - Allow the founder to unfound the society when they are the only member.
 //!
 //! #### For Super Users
 //!
@@ -254,15 +255,15 @@ use sp_std::prelude::*;
 use codec::{Encode, Decode};
 use sp_runtime::{Percent, ModuleId, RuntimeDebug,
 	traits::{
-		StaticLookup, AccountIdConversion, Saturating, Zero, IntegerSquareRoot,
+		StaticLookup, AccountIdConversion, Saturating, Zero, IntegerSquareRoot, Hash,
 		TrailingZeroInput, CheckedSub, EnsureOrigin
 	}
 };
 use frame_support::{decl_error, decl_module, decl_storage, decl_event, ensure, dispatch::DispatchResult};
 use frame_support::weights::SimpleDispatchInfo;
 use frame_support::traits::{
-	Currency, ReservableCurrency, Randomness, Get, ChangeMembers,
-	ExistenceRequirement::{KeepAlive, AllowDeath},
+	Currency, ReservableCurrency, Randomness, Get, ChangeMembers, BalanceStatus,
+	ExistenceRequirement::AllowDeath,
 };
 use frame_system::{self as system, ensure_signed, ensure_root};
 
@@ -404,12 +405,17 @@ decl_storage! {
 		pub Founder get(founder) build(|config: &GenesisConfig<T, I>| config.members.first().cloned()):
 			Option<T::AccountId>;
 
+		/// A hash of the rules of this society concerning membership. Can only be set once and
+		/// only by the founder.
+		pub Rules get(rules): Option<T::Hash>;
+
 		/// The current set of candidates; bidders that are attempting to become members.
 		pub Candidates get(candidates): Vec<Bid<T::AccountId, BalanceOf<T, I>>>;
 
 		/// The set of suspended candidates.
 		pub SuspendedCandidates get(suspended_candidate):
-			map T::AccountId => Option<(BalanceOf<T, I>, BidKind<T::AccountId, BalanceOf<T, I>>)>;
+			map hasher(blake2_256) T::AccountId
+			=> Option<(BalanceOf<T, I>, BidKind<T::AccountId, BalanceOf<T, I>>)>;
 
 		/// Amount of our account balance that is specifically for the next round's bid(s).
 		pub Pot get(fn pot) config(): BalanceOf<T, I>;
@@ -426,19 +432,19 @@ decl_storage! {
 		}): Vec<T::AccountId>;
 
 		/// The set of suspended members.
-		pub SuspendedMembers get(fn suspended_member): map T::AccountId => Option<()>;
+		pub SuspendedMembers get(fn suspended_member): map hasher(blake2_256) T::AccountId => bool;
 
 		/// The current bids, stored ordered by the value of the bid.
 		Bids: Vec<Bid<T::AccountId, BalanceOf<T, I>>>;
 
 		/// Members currently vouching or banned from vouching again
-		Vouching get(fn vouching): map T::AccountId => Option<VouchingStatus>;
+		Vouching get(fn vouching): map hasher(blake2_256) T::AccountId => Option<VouchingStatus>;
 
 		/// Pending payouts; ordered by block number, with the amount that should be paid out.
-		Payouts: map T::AccountId => Vec<(T::BlockNumber, BalanceOf<T, I>)>;
+		Payouts: map hasher(blake2_256) T::AccountId => Vec<(T::BlockNumber, BalanceOf<T, I>)>;
 
 		/// The ongoing number of losing votes cast by the member.
-		Strikes: map T::AccountId => StrikeCount;
+		Strikes: map hasher(blake2_256) T::AccountId => StrikeCount;
 
 		/// Double map from Candidate -> Voter -> (Maybe) Vote.
 		Votes: double_map
@@ -524,8 +530,8 @@ decl_module! {
 		#[weight = SimpleDispatchInfo::FixedNormal(50_000)]
 		pub fn bid(origin, value: BalanceOf<T, I>) -> DispatchResult {
 			let who = ensure_signed(origin)?;
-			ensure!(!<SuspendedCandidates<T, I>>::exists(&who), Error::<T, I>::Suspended);
-			ensure!(!<SuspendedMembers<T, I>>::exists(&who), Error::<T, I>::Suspended);
+			ensure!(!<SuspendedCandidates<T, I>>::contains_key(&who), Error::<T, I>::Suspended);
+			ensure!(!<SuspendedMembers<T, I>>::contains_key(&who), Error::<T, I>::Suspended);
 			let bids = <Bids<T, I>>::get();
 			ensure!(!Self::is_bid(&bids, &who), Error::<T, I>::AlreadyBid);
 			let candidates = <Candidates<T, I>>::get();
@@ -634,8 +640,8 @@ decl_module! {
 		pub fn vouch(origin, who: T::AccountId, value: BalanceOf<T, I>, tip: BalanceOf<T, I>) -> DispatchResult {
 			let voucher = ensure_signed(origin)?;
 			// Check user is not suspended.
-			ensure!(!<SuspendedCandidates<T, I>>::exists(&who), Error::<T, I>::Suspended);
-			ensure!(!<SuspendedMembers<T, I>>::exists(&who), Error::<T, I>::Suspended);
+			ensure!(!<SuspendedCandidates<T, I>>::contains_key(&who), Error::<T, I>::Suspended);
+			ensure!(!<SuspendedMembers<T, I>>::contains_key(&who), Error::<T, I>::Suspended);
 			// Check user is not a bid or candidate.
 			let bids = <Bids<T, I>>::get();
 			ensure!(!Self::is_bid(&bids, &who), Error::<T, I>::AlreadyBid);
@@ -646,7 +652,7 @@ decl_module! {
 			ensure!(!Self::is_member(&members, &who), Error::<T, I>::AlreadyMember);
 			// Check sender can vouch.
 			ensure!(Self::is_member(&members, &voucher), Error::<T, I>::NotMember);
-			ensure!(!<Vouching<T, I>>::exists(&voucher), Error::<T, I>::AlreadyVouching);
+			ensure!(!<Vouching<T, I>>::contains_key(&voucher), Error::<T, I>::AlreadyVouching);
 
 			<Vouching<T, I>>::insert(&voucher, VouchingStatus::Vouching);
 			Self::put_bid(bids, &who, value.clone(), BidKind::Vouch(voucher.clone(), tip));
@@ -782,7 +788,7 @@ decl_module! {
 			let mut payouts = <Payouts<T, I>>::get(&who);
 			if let Some((when, amount)) = payouts.first() {
 				if when <= &<system::Module<T>>::block_number() {
-					T::Currency::transfer(&Self::payouts(), &who, *amount, KeepAlive)?;
+					T::Currency::transfer(&Self::payouts(), &who, *amount, AllowDeath)?;
 					payouts.remove(0);
 					if payouts.is_empty() {
 						<Payouts<T, I>>::remove(&who);
@@ -804,6 +810,8 @@ decl_module! {
 		///
 		/// Parameters:
 		/// - `founder` - The first member and head of the newly founded society.
+		/// - `max_members` - The initial max number of members for the society.
+		/// - `rules` - The rules of this society concerning membership.
 		///
 		/// # <weight>
 		/// - Two storage mutates to set `Head` and `Founder`. O(1)
@@ -813,15 +821,47 @@ decl_module! {
 		/// Total Complexity: O(1)
 		/// # </weight>
 		#[weight = SimpleDispatchInfo::FixedNormal(10_000)]
-		fn found(origin, founder: T::AccountId) {
+		fn found(origin, founder: T::AccountId, max_members: u32, rules: Vec<u8>) {
 			T::FounderSetOrigin::ensure_origin(origin)?;
 			ensure!(!<Head<T, I>>::exists(), Error::<T, I>::AlreadyFounded);
+			ensure!(max_members > 1, Error::<T, I>::MaxMembers);
 			// This should never fail in the context of this function...
+			<MaxMembers<I>>::put(max_members);
 			Self::add_member(&founder)?;
 			<Head<T, I>>::put(&founder);
 			<Founder<T, I>>::put(&founder);
+			Rules::<T, I>::put(T::Hashing::hash(&rules));
 			Self::deposit_event(RawEvent::Founded(founder));
 		}
+
+		/// Annul the founding of the society.
+		///
+		/// The dispatch origin for this call must be Signed, and the signing account must be both
+		/// the `Founder` and the `Head`. This implies that it may only be done when there is one
+		/// member.
+		///
+		/// # <weight>
+		/// - Two storage reads O(1).
+		/// - Four storage removals O(1).
+		/// - One event.
+		///
+		/// Total Complexity: O(1)
+		/// # </weight>
+		#[weight = SimpleDispatchInfo::FixedNormal(20_000)]
+		fn unfound(origin) {
+			let founder = ensure_signed(origin)?;
+			ensure!(Founder::<T, I>::get() == Some(founder.clone()), Error::<T, I>::NotFounder);
+			ensure!(Head::<T, I>::get() == Some(founder.clone()), Error::<T, I>::NotHead);
+
+			Members::<T, I>::kill();
+			Head::<T, I>::kill();
+			Founder::<T, I>::kill();
+			Rules::<T, I>::kill();
+			Candidates::<T, I>::kill();
+			SuspendedCandidates::<T, I>::remove_all();
+			Self::deposit_event(RawEvent::Unfounded(founder));
+		}
+
 		/// Allow suspension judgement origin to make judgement on a suspended member.
 		///
 		/// If a suspended member is forgiven, we simply add them back as a member, not affecting
@@ -852,7 +892,7 @@ decl_module! {
 		#[weight = SimpleDispatchInfo::FixedNormal(30_000)]
 		fn judge_suspended_member(origin, who: T::AccountId, forgive: bool) {
 			T::SuspensionJudgementOrigin::ensure_origin(origin)?;
-			ensure!(<SuspendedMembers<T, I>>::exists(&who), Error::<T, I>::NotSuspended);
+			ensure!(<SuspendedMembers<T, I>>::contains_key(&who), Error::<T, I>::NotSuspended);
 
 			if forgive {
 				// Try to add member back to society. Can fail with `MaxMembers` limit.
@@ -944,7 +984,7 @@ decl_module! {
 						match kind {
 							BidKind::Deposit(deposit) => {
 								// Slash deposit and move it to the society account
-								let _ = T::Currency::repatriate_reserved(&who, &Self::account_id(), deposit);
+								let _ = T::Currency::repatriate_reserved(&who, &Self::account_id(), deposit, BalanceStatus::Free);
 							}
 							BidKind::Vouch(voucher, _) => {
 								// Ban the voucher from vouching again
@@ -1044,6 +1084,10 @@ decl_error! {
 		NotCandidate,
 		/// Too many members in the society.
 		MaxMembers,
+		/// The caller is not the founder.
+		NotFounder,
+		/// The caller is not the head.
+		NotHead,
 	}
 }
 
@@ -1084,6 +1128,8 @@ decl_event! {
 		DefenderVote(AccountId, bool),
 		/// A new max member count has been set
 		NewMaxMembers(u32),
+		/// Society is unfounded.
+		Unfounded(AccountId),
 	}
 }
 
@@ -1221,16 +1267,16 @@ impl<T: Trait<I>, I: Instance> Module<T, I> {
 		ensure!(Self::head() != Some(m.clone()), Error::<T, I>::Head);
 		ensure!(Self::founder() != Some(m.clone()), Error::<T, I>::Founder);
 
-		<Members<T, I>>::mutate(|members|
-			match members.binary_search(&m) {
-				Err(_) => Err(Error::<T, I>::NotMember)?,
-				Ok(i) => {
-					members.remove(i);
-					T::MembershipChanged::change_members_sorted(&[], &[m.clone()], members);
-					Ok(())
-				}
+		let mut members = <Members<T, I>>::get();
+		match members.binary_search(&m) {
+			Err(_) => Err(Error::<T, I>::NotMember)?,
+			Ok(i) => {
+				members.remove(i);
+				T::MembershipChanged::change_members_sorted(&[], &[m.clone()], &members[..]);
+				<Members<T, I>>::put(members);
+				Ok(())
 			}
-		)
+		}
 	}
 
 	/// End the current period and begin a new one.
@@ -1320,6 +1366,9 @@ impl<T: Trait<I>, I: Instance> Module<T, I> {
 					None
 				}
 			}).collect::<Vec<_>>();
+
+			// Clean up all votes.
+			<Votes<T, I>>::remove_all();
 
 			// Reward one of the voters who voted the right way.
 			if !total_slash.is_zero() {
@@ -1423,7 +1472,7 @@ impl<T: Trait<I>, I: Instance> Module<T, I> {
 	/// Suspend a user, removing them from the member list.
 	fn suspend_member(who: &T::AccountId) {
 		if Self::remove_member(&who).is_ok() {
-			<SuspendedMembers<T, I>>::insert(who, ());
+			<SuspendedMembers<T, I>>::insert(who, true);
 			<Strikes<T, I>>::remove(who);
 			Self::deposit_event(RawEvent::MemberSuspended(who.clone()));
 		}
@@ -1469,7 +1518,7 @@ impl<T: Trait<I>, I: Instance> Module<T, I> {
 				let mut rejection_count = 0;
 				// Tallies total number of approve and reject votes for the defender.
 				members.iter()
-					.filter_map(|m| <DefenderVotes<T, I>>::get(m))
+					.filter_map(|m| <DefenderVotes<T, I>>::take(m))
 					.for_each(|v| {
 						match v {
 							Vote::Approve => approval_count += 1,
@@ -1482,20 +1531,29 @@ impl<T: Trait<I>, I: Instance> Module<T, I> {
 					Self::suspend_member(&defender);
 					*members = Self::members();
 				}
+
+				// Clean up all votes.
+				<DefenderVotes<T, I>>::remove_all();
 			}
 
-			// Start a new defender rotation
-			let phrase = b"society_challenge";
-			// we'll need a random seed here.
-			let seed = T::Randomness::random(phrase);
-			// seed needs to be guaranteed to be 32 bytes.
-			let seed = <[u8; 32]>::decode(&mut TrailingZeroInput::new(seed.as_ref()))
-				.expect("input is padded with zeroes; qed");
-			let mut rng = ChaChaRng::from_seed(seed);
-			let chosen = pick_item(&mut rng, &members).expect("exited if members empty; qed");
-
-			<Defender<T, I>>::put(&chosen);
-			Self::deposit_event(RawEvent::Challenged(chosen.clone()));
+			// Avoid challenging if there's only two members since we never challenge the Head or
+			// the Founder.
+			if members.len() > 2 {
+				// Start a new defender rotation
+				let phrase = b"society_challenge";
+				// we'll need a random seed here.
+				let seed = T::Randomness::random(phrase);
+				// seed needs to be guaranteed to be 32 bytes.
+				let seed = <[u8; 32]>::decode(&mut TrailingZeroInput::new(seed.as_ref()))
+					.expect("input is padded with zeroes; qed");
+				let mut rng = ChaChaRng::from_seed(seed);
+				let chosen = pick_item(&mut rng, &members[1..members.len() - 1])
+					.expect("exited if members empty; qed");
+				<Defender<T, I>>::put(&chosen);
+				Self::deposit_event(RawEvent::Challenged(chosen.clone()));
+			} else {
+				<Defender<T, I>>::kill();
+			}
 		}
 	}
 

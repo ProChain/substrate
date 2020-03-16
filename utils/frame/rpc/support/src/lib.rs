@@ -33,9 +33,7 @@ use sc_rpc_api::state::StateClient;
 /// A typed query on chain state usable from an RPC client.
 ///
 /// ```no_run
-/// # use futures::compat::Compat;
 /// # use futures::compat::Future01CompatExt;
-/// # use futures::future::FutureExt;
 /// # use jsonrpc_client_transports::RpcError;
 /// # use jsonrpc_client_transports::transports::http;
 /// # use codec::Encode;
@@ -49,7 +47,7 @@ use sc_rpc_api::state::StateClient;
 /// # type Hash = ();
 /// #
 /// # fn main() -> Result<(), RpcError> {
-/// #     tokio::runtime::Runtime::new().unwrap().block_on(Compat::new(test().boxed()))
+/// #     tokio::runtime::Runtime::new().unwrap().block_on(test())
 /// # }
 /// #
 /// # struct TestRuntime;
@@ -65,9 +63,9 @@ use sc_rpc_api::state::StateClient;
 /// decl_storage! {
 ///     trait Store for Module<T: Trait> as TestRuntime {
 ///         pub LastActionId: u64;
-///         pub Voxels: map Loc => Block;
-///         pub Actions: linked_map u64 => Loc;
-///         pub Prefab: double_map u128, (i8, i8, i8) => Block;
+///         pub Voxels: map hasher(blake2_256) Loc => Block;
+///         pub Actions: linked_map hasher(blake2_256) u64 => Loc;
+///         pub Prefab: double_map hasher(blake2_256) u128, hasher(blake2_256) (i8, i8, i8) => Block;
 ///     }
 /// }
 ///

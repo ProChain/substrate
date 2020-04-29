@@ -37,10 +37,14 @@ use sc_service::{
 	Role,
 	Error,
 };
+use sp_blockchain::HeaderBackend;
 use sc_network::{multiaddr, Multiaddr};
 use sc_network::config::{NetworkConfiguration, TransportConfig};
 use sp_runtime::{generic::BlockId, traits::Block as BlockT};
 use sp_transaction_pool::TransactionPool;
+
+#[cfg(test)]
+mod client;
 
 /// Maximum duration of single wait call.
 const MAX_WAIT_TIME: Duration = Duration::from_secs(60 * 3);
@@ -143,13 +147,14 @@ fn node_config<G: RuntimeGenesis + 'static, E: ChainSpecExtension + Clone + 'sta
 {
 	let root = root.path().join(format!("node-{}", index));
 
-	let net_config_path = root.join("network");
-
 	let mut network_config = NetworkConfiguration::new(
 		format!("Node {}", index),
 		"network/test/0.1",
-		Default::default(), &net_config_path,
+		Default::default(),
+		None,
 	);
+
+	network_config.allow_non_globals_in_dht = true;
 
 	network_config.listen_addresses.push(
 		iter::once(multiaddr::Protocol::Ip4(Ipv4Addr::new(127, 0, 0, 1)))
@@ -175,7 +180,7 @@ fn node_config<G: RuntimeGenesis + 'static, E: ChainSpecExtension + Clone + 'sta
 			path: root.join("key"),
 			password: None
 		},
-		database: DatabaseConfig::Path {
+		database: DatabaseConfig::RocksDb {
 			path: root.join("db"),
 			cache_size: 128,
 		},
@@ -185,6 +190,7 @@ fn node_config<G: RuntimeGenesis + 'static, E: ChainSpecExtension + Clone + 'sta
 		chain_spec: Box::new((*spec).clone()),
 		wasm_method: sc_service::config::WasmExecutionMethod::Interpreted,
 		execution_strategies: Default::default(),
+		unsafe_rpc_expose: false,
 		rpc_http: None,
 		rpc_ws: None,
 		rpc_ws_max_connections: None,
@@ -193,7 +199,7 @@ fn node_config<G: RuntimeGenesis + 'static, E: ChainSpecExtension + Clone + 'sta
 		telemetry_endpoints: None,
 		telemetry_external_transport: None,
 		default_heap_pages: None,
-		offchain_worker: false,
+		offchain_worker: Default::default(),
 		force_authoring: false,
 		disable_grandpa: false,
 		dev_key_seed: key_seed,
@@ -460,15 +466,15 @@ pub fn sync<G, E, Fb, F, Lb, L, B, ExF, U>(
 	}
 	network.run_until_all_full(
 		|_index, service|
-			service.get().client().chain_info().best_number == (NUM_BLOCKS as u32).into(),
+			service.get().client().info().best_number == (NUM_BLOCKS as u32).into(),
 		|_index, service|
-			service.get().client().chain_info().best_number == (NUM_BLOCKS as u32).into(),
+			service.get().client().info().best_number == (NUM_BLOCKS as u32).into(),
 	);
 
 	info!("Checking extrinsic propagation");
 	let first_service = network.full_nodes[0].1.clone();
 	let first_user_data = &network.full_nodes[0].2;
-	let best_block = BlockId::number(first_service.get().client().chain_info().best_number);
+	let best_block = BlockId::number(first_service.get().client().info().best_number);
 	let extrinsic = extrinsic_factory(&first_service.get(), first_user_data);
 	let source = sp_transaction_pool::TransactionSource::External;
 
@@ -521,9 +527,9 @@ pub fn consensus<G, E, Fb, F, Lb, L>(
 	}
 	network.run_until_all_full(
 		|_index, service|
-			service.get().client().chain_info().finalized_number >= (NUM_BLOCKS as u32 / 2).into(),
+			service.get().client().info().finalized_number >= (NUM_BLOCKS as u32 / 2).into(),
 		|_index, service|
-			service.get().client().chain_info().best_number >= (NUM_BLOCKS as u32 / 2).into(),
+			service.get().client().info().best_number >= (NUM_BLOCKS as u32 / 2).into(),
 	);
 
 	info!("Adding more peers");
@@ -543,8 +549,8 @@ pub fn consensus<G, E, Fb, F, Lb, L>(
 	}
 	network.run_until_all_full(
 		|_index, service|
-			service.get().client().chain_info().finalized_number >= (NUM_BLOCKS as u32).into(),
+			service.get().client().info().finalized_number >= (NUM_BLOCKS as u32).into(),
 		|_index, service|
-			service.get().client().chain_info().best_number >= (NUM_BLOCKS as u32).into(),
+			service.get().client().info().best_number >= (NUM_BLOCKS as u32).into(),
 	);
 }

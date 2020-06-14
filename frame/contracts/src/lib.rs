@@ -117,7 +117,7 @@ use frame_support::{
 	parameter_types, IsSubType, storage::child::{self, ChildInfo},
 };
 use frame_support::traits::{OnUnbalanced, Currency, Get, Time, Randomness};
-use frame_support::weights::{FunctionOf, DispatchClass, Weight, GetDispatchInfo, Pays};
+use frame_support::weights::GetDispatchInfo;
 use frame_system::{self as system, ensure_signed, RawOrigin, ensure_root};
 use pallet_contracts_primitives::{RentProjection, ContractAccessError};
 
@@ -203,8 +203,15 @@ pub type AliveContractInfo<T> =
 pub struct RawAliveContractInfo<CodeHash, Balance, BlockNumber> {
 	/// Unique ID for the subtree encoded as a bytes vector.
 	pub trie_id: TrieId,
-	/// The size of stored value in octet.
+	/// The total number of bytes used by this contract.
+	///
+	/// It is a sum of each key-value pair stored by this contract.
 	pub storage_size: u32,
+	/// The number of key-value pairs that have values of zero length.
+	/// The condition `empty_pair_count ≤ total_pair_count` always holds.
+	pub empty_pair_count: u32,
+	/// The total number of key-value pairs in storage of this contract.
+	pub total_pair_count: u32,
 	/// The code associated with a given account.
 	pub code_hash: CodeHash,
 	/// Pay rent at most up to this value.
@@ -338,8 +345,11 @@ pub trait Trait: frame_system::Trait + pallet_transaction_payment::Trait {
 	/// The minimum amount required to generate a tombstone.
 	type TombstoneDeposit: Get<BalanceOf<Self>>;
 
-	/// Size of a contract at the time of instantiation. This is a simple way to ensure
-	/// that empty contracts eventually gets deleted.
+	/// A size offset for an contract. A just created account with untouched storage will have that
+	/// much of storage from the perspective of the state rent.
+	///
+	/// This is a simple way to ensure that contracts with empty storage eventually get deleted by
+	/// making them pay rent. This creates an incentive to remove them early in order to save rent.
 	type StorageSizeOffset: Get<u32>;
 
 	/// Price of a byte of storage per one block interval. Should be greater than 0.
@@ -420,8 +430,12 @@ decl_module! {
 		/// The minimum amount required to generate a tombstone.
 		const TombstoneDeposit: BalanceOf<T> = T::TombstoneDeposit::get();
 
-		/// Size of a contract at the time of instantiation. This is a simple way to ensure that
-		/// empty contracts eventually gets deleted.
+		/// A size offset for an contract. A just created account with untouched storage will have that
+		/// much of storage from the perspective of the state rent.
+		///
+		/// This is a simple way to ensure that contracts with empty storage eventually get deleted
+		/// by making them pay rent. This creates an incentive to remove them early in order to save
+		/// rent.
 		const StorageSizeOffset: u32 = T::StorageSizeOffset::get();
 
 		/// Price of a byte of storage per one block interval. Should be greater than 0.
@@ -467,11 +481,7 @@ decl_module! {
 
 		/// Stores the given binary Wasm code into the chain's storage and returns its `codehash`.
 		/// You can instantiate contracts only with stored code.
-		#[weight = FunctionOf(
-			|args: (&Vec<u8>,)| Module::<T>::calc_code_put_costs(args.0),
-			DispatchClass::Normal,
-			Pays::Yes
-		)]
+		#[weight = Module::<T>::calc_code_put_costs(&code)]
 		pub fn put_code(
 			origin,
 			code: Vec<u8>
@@ -492,11 +502,7 @@ decl_module! {
 		/// * If the account is a regular account, any value will be transferred.
 		/// * If no account exists and the call value is not less than `existential_deposit`,
 		/// a regular account will be created and any value will be transferred.
-		#[weight = FunctionOf(
-			|args: (&<T::Lookup as StaticLookup>::Source, &BalanceOf<T>, &Weight, &Vec<u8>)| *args.2,
-			DispatchClass::Normal,
-			Pays::Yes
-		)]
+		#[weight = *gas_limit]
 		pub fn call(
 			origin,
 			dest: <T::Lookup as StaticLookup>::Source,
@@ -524,11 +530,7 @@ decl_module! {
 		///   after the execution is saved as the `code` of the account. That code will be invoked
 		///   upon any call received by this account.
 		/// - The contract is initialized.
-		#[weight = FunctionOf(
-			|args: (&BalanceOf<T>, &Weight, &CodeHash<T>, &Vec<u8>)| *args.1,
-			DispatchClass::Normal,
-			Pays::Yes
-		)]
+		#[weight = *gas_limit]
 		pub fn instantiate(
 			origin,
 			#[compact] endowment: BalanceOf<T>,
@@ -697,7 +699,7 @@ impl<T: Trait> Module<T> {
 		dest: T::AccountId,
 		code_hash: CodeHash<T>,
 		rent_allowance: BalanceOf<T>,
-		delta: Vec<exec::StorageKey>
+		delta: Vec<exec::StorageKey>,
 	) -> DispatchResult {
 		let mut origin_contract = <ContractInfoOf<T>>::get(&origin)
 			.and_then(|c| c.get_alive())
@@ -764,6 +766,8 @@ impl<T: Trait> Module<T> {
 		<ContractInfoOf<T>>::insert(&dest, ContractInfo::Alive(RawAliveContractInfo {
 			trie_id: origin_contract.trie_id,
 			storage_size: origin_contract.storage_size,
+			empty_pair_count: origin_contract.empty_pair_count,
+			total_pair_count: origin_contract.total_pair_count,
 			code_hash,
 			rent_allowance,
 			deduct_block: current_block,
@@ -836,6 +840,8 @@ decl_storage! {
 		/// The subtrie counter.
 		pub AccountCounter: u64 = 0;
 		/// The code associated with a given account.
+		///
+		/// TWOX-NOTE: SAFE since `AccountId` is a secure hash.
 		pub ContractInfoOf: map hasher(twox_64_concat) T::AccountId => Option<ContractInfo<T>>;
 	}
 }

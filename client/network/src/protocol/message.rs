@@ -25,7 +25,6 @@ pub use self::generic::{
 	BlockAnnounce, RemoteCallRequest, RemoteReadRequest,
 	RemoteHeaderRequest, RemoteHeaderResponse,
 	RemoteChangesRequest, RemoteChangesResponse,
-	FinalityProofRequest, FinalityProofResponse,
 	FromBlock, RemoteReadChildRequest, Roles,
 };
 use sc_client_api::StorageProof;
@@ -39,12 +38,6 @@ pub type Message<B> = generic::Message<
 	<B as BlockT>::Hash,
 	<<B as BlockT>::Header as HeaderT>::Number,
 	<B as BlockT>::Extrinsic,
->;
-
-/// Type alias for using the status type using block type parameters.
-pub type Status<B> = generic::Status<
-	<B as BlockT>::Hash,
-	<<B as BlockT>::Header as HeaderT>::Number,
 >;
 
 /// Type alias for using the block request type using block type parameters.
@@ -84,6 +77,20 @@ bitflags! {
 		const MESSAGE_QUEUE = 0b00001000;
 		/// Include a justification for the block.
 		const JUSTIFICATION = 0b00010000;
+	}
+}
+
+impl BlockAttributes {
+	/// Encodes attributes as big endian u32, compatible with SCALE-encoding (i.e the
+	/// significant byte has zero index).
+	pub fn to_be_u32(&self) -> u32 {
+		u32::from_be_bytes([self.bits(), 0, 0, 0])
+	}
+
+	/// Decodes attributes, encoded with the `encode_to_be_u32()` call.
+	pub fn from_be_u32(encoded: u32) -> Result<Self, Error> {
+		BlockAttributes::from_bits(encoded.to_be_bytes()[0])
+			.ok_or_else(|| Error::from("Invalid BlockAttributes"))
 	}
 }
 
@@ -208,7 +215,7 @@ pub mod generic {
 	#[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
 	pub struct ConsensusMessage {
 		/// Identifies consensus engine.
-		pub engine_id: ConsensusEngineId,
+		pub protocol: ConsensusEngineId,
 		/// Message payload.
 		pub data: Vec<u8>,
 	}
@@ -272,11 +279,10 @@ pub mod generic {
 		RemoteChangesResponse(RemoteChangesResponse<Number, Hash>),
 		/// Remote child storage read request.
 		RemoteReadChildRequest(RemoteReadChildRequest<Hash>),
-		/// Finality proof request.
-		FinalityProofRequest(FinalityProofRequest<Hash>),
-		/// Finality proof response.
-		FinalityProofResponse(FinalityProofResponse<Hash>),
 		/// Batch of consensus protocol messages.
+		// NOTE: index is incremented by 2 due to finality proof related
+		// messages that were removed.
+		#[codec(index = "17")]
 		ConsensusBatch(Vec<ConsensusMessage>),
 	}
 
@@ -299,8 +305,6 @@ pub mod generic {
 				Message::RemoteChangesRequest(_) => "RemoteChangesRequest",
 				Message::RemoteChangesResponse(_) => "RemoteChangesResponse",
 				Message::RemoteReadChildRequest(_) => "RemoteReadChildRequest",
-				Message::FinalityProofRequest(_) => "FinalityProofRequest",
-				Message::FinalityProofResponse(_) => "FinalityProofResponse",
 				Message::ConsensusBatch(_) => "ConsensusBatch",
 			}
 		}
@@ -537,27 +541,5 @@ pub mod generic {
 		pub roots: Vec<(N, H)>,
 		/// Missing changes tries roots proof.
 		pub roots_proof: StorageProof,
-	}
-
-	#[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
-	/// Finality proof request.
-	pub struct FinalityProofRequest<H> {
-		/// Unique request id.
-		pub id: RequestId,
-		/// Hash of the block to request proof for.
-		pub block: H,
-		/// Additional data blob (that both requester and provider understood) required for proving finality.
-		pub request: Vec<u8>,
-	}
-
-	#[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
-	/// Finality proof response.
-	pub struct FinalityProofResponse<H> {
-		/// Id of a request this response was made for.
-		pub id: RequestId,
-		/// Hash of the block (the same as in the FinalityProofRequest).
-		pub block: H,
-		/// Finality proof (if available).
-		pub proof: Option<Vec<u8>>,
 	}
 }

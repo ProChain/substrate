@@ -77,7 +77,6 @@ pub fn signed_extra(nonce: Index, extra_fee: Balance) -> SignedExtra {
 		frame_system::CheckNonce::from(nonce),
 		frame_system::CheckWeight::new(),
 		pallet_transaction_payment::ChargeTransactionPayment::from(extra_fee),
-		pallet_grandpa::ValidateEquivocationReport::new(),
 	)
 }
 
@@ -95,7 +94,7 @@ pub fn sign(xt: CheckedExtrinsic, spec_version: u32, tx_version: u32, genesis_ha
 				}
 			}).into();
 			UncheckedExtrinsic {
-				signature: Some((pallet_indices::address::Address::Id(signed), signature, extra)),
+				signature: Some((sp_runtime::MultiAddress::Id(signed), signature, extra)),
 				function: payload.0,
 			}
 		}

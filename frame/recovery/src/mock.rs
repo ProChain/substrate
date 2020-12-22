@@ -21,14 +21,11 @@ use super::*;
 
 use frame_support::{
 	impl_outer_origin, impl_outer_dispatch, impl_outer_event, parameter_types,
-	weights::Weight,
 	traits::{OnInitialize, OnFinalize},
 };
 use sp_core::H256;
-// The testing primitives are very useful for avoiding having to work with signatures
-// or public keys. `u64` is used as the `AccountId` and no `Signature`s are required.
 use sp_runtime::{
-	Perbill, traits::{BlakeTwo256, IdentityLookup}, testing::Header,
+	traits::{BlakeTwo256, IdentityLookup}, testing::Header,
 };
 use crate as recovery;
 
@@ -50,20 +47,20 @@ impl_outer_dispatch! {
 	}
 }
 
-// For testing the pallet, we construct most of a mock runtime. This means
-// first constructing a configuration type (`Test`) which `impl`s each of the
-// configuration traits of pallets we want to use.
 #[derive(Clone, Eq, PartialEq)]
 pub struct Test;
 
 parameter_types! {
 	pub const BlockHashCount: u64 = 250;
-	pub const MaximumBlockWeight: Weight = 1024;
-	pub const MaximumBlockLength: u32 = 2 * 1024;
-	pub const AvailableBlockRatio: Perbill = Perbill::one();
+	pub BlockWeights: frame_system::limits::BlockWeights =
+		frame_system::limits::BlockWeights::simple_max(1024);
 }
 
-impl frame_system::Trait for Test {
+impl frame_system::Config for Test {
+	type BaseCallFilter = ();
+	type BlockWeights = ();
+	type BlockLength = ();
+	type DbWeight = ();
 	type Origin = Origin;
 	type Call = Call;
 	type Index = u64;
@@ -75,30 +72,26 @@ impl frame_system::Trait for Test {
 	type Header = Header;
 	type Event = TestEvent;
 	type BlockHashCount = BlockHashCount;
-	type MaximumBlockWeight = MaximumBlockWeight;
-	type DbWeight = ();
-	type BlockExecutionWeight = ();
-	type ExtrinsicBaseWeight = ();
-	type MaximumExtrinsicWeight = MaximumBlockWeight;
-	type MaximumBlockLength = MaximumBlockLength;
-	type AvailableBlockRatio = AvailableBlockRatio;
 	type Version = ();
-	type ModuleToIndex = ();
+	type PalletInfo = ();
 	type AccountData = pallet_balances::AccountData<u128>;
 	type OnNewAccount = ();
 	type OnKilledAccount = ();
+	type SystemWeightInfo = ();
 }
 
 parameter_types! {
 	pub const ExistentialDeposit: u64 = 1;
 }
 
-impl pallet_balances::Trait for Test {
+impl pallet_balances::Config for Test {
+	type MaxLocks = ();
 	type Balance = u128;
 	type DustRemoval = ();
 	type Event = TestEvent;
 	type ExistentialDeposit = ExistentialDeposit;
 	type AccountStore = System;
+	type WeightInfo = ();
 }
 
 parameter_types! {
@@ -108,7 +101,7 @@ parameter_types! {
 	pub const RecoveryDeposit: u64 = 10;
 }
 
-impl Trait for Test {
+impl Config for Test {
 	type Event = TestEvent;
 	type Call = Call;
 	type Currency = Balances;

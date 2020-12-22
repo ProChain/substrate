@@ -15,6 +15,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
 //! Substrate externalities abstraction
 //!
 //! The externalities mainly provide access to storage and to registered extensions. Extensions
@@ -23,9 +25,9 @@
 //!
 //! This crate exposes the main [`Externalities`] trait.
 
-use std::any::{Any, TypeId};
+use sp_std::{any::{Any, TypeId}, vec::Vec, boxed::Box};
 
-use sp_storage::ChildInfo;
+use sp_storage::{ChildInfo, TrackedStorageKey};
 
 pub use scope_limited::{set_and_run_with_externalities, with_externalities};
 pub use extensions::{Extension, Extensions, ExtensionStore};
@@ -135,7 +137,17 @@ pub trait Externalities: ExtensionStore {
 	) -> Option<Vec<u8>>;
 
 	/// Clear an entire child storage.
-	fn kill_child_storage(&mut self, child_info: &ChildInfo);
+	///
+	/// Deletes all keys from the overlay and up to `limit` keys from the backend. No
+	/// limit is applied if `limit` is `None`. Returns `true` if the child trie was
+	/// removed completely and `false` if there are remaining keys after the function
+	/// returns.
+	///
+	/// # Note
+	///
+	/// An implementation is free to delete more keys than the specified limit as long as
+	/// it is able to do that in constant time.
+	fn kill_child_storage(&mut self, child_info: &ChildInfo, limit: Option<u32>) -> bool;
 
 	/// Clear storage entries which keys are start with the given prefix.
 	fn clear_prefix(&mut self, prefix: &[u8]);
@@ -195,6 +207,29 @@ pub trait Externalities: ExtensionStore {
 	/// The returned hash is defined by the `Block` and is SCALE encoded.
 	fn storage_changes_root(&mut self, parent: &[u8]) -> Result<Option<Vec<u8>>, ()>;
 
+	/// Start a new nested transaction.
+	///
+	/// This allows to either commit or roll back all changes made after this call to the
+	/// top changes or the default child changes. For every transaction there cam be a
+	/// matching call to either `storage_rollback_transaction` or `storage_commit_transaction`.
+	/// Any transactions that are still open after returning from runtime are committed
+	/// automatically.
+	///
+	/// Changes made without any open transaction are committed immediately.
+	fn storage_start_transaction(&mut self);
+
+	/// Rollback the last transaction started by `storage_start_transaction`.
+	///
+	/// Any changes made during that storage transaction are discarded. Returns an error when
+	/// no transaction is open that can be closed.
+	fn storage_rollback_transaction(&mut self) -> Result<(), ()>;
+
+	/// Commit the last transaction started by `storage_start_transaction`.
+	///
+	/// Any changes made during that storage transaction are committed. Returns an error when
+	/// no transaction is open that can be closed.
+	fn storage_commit_transaction(&mut self) -> Result<(), ()>;
+
 	/// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 	/// Benchmarking related functionality and shouldn't be used anywhere else!
 	/// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -210,6 +245,34 @@ pub trait Externalities: ExtensionStore {
 	///
 	/// Commits all changes to the database and clears all caches.
 	fn commit(&mut self);
+
+	/// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	/// Benchmarking related functionality and shouldn't be used anywhere else!
+	/// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	///
+	/// Gets the current read/write count for the benchmarking process.
+	fn read_write_count(&self) -> (u32, u32, u32, u32);
+
+	/// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	/// Benchmarking related functionality and shouldn't be used anywhere else!
+	/// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	///
+	/// Resets read/write count for the benchmarking process.
+	fn reset_read_write_count(&mut self);
+
+	/// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	/// Benchmarking related functionality and shouldn't be used anywhere else!
+	/// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	///
+	/// Gets the current DB tracking whitelist.
+	fn get_whitelist(&self) -> Vec<TrackedStorageKey>;
+
+	/// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	/// Benchmarking related functionality and shouldn't be used anywhere else!
+	/// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+	///
+	/// Adds new storage keys to the DB tracking whitelist.
+	fn set_whitelist(&mut self, new: Vec<TrackedStorageKey>);
 }
 
 /// Extension for the [`Externalities`] trait.

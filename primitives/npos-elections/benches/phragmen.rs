@@ -59,8 +59,8 @@ mod bench_closure_and_slice {
 	}
 
 	/// Converts a vector of ratio assignments into ones with absolute budget value.
-	pub fn assignment_ratio_to_staked_slice<A: IdentifierT, T: PerThing>(
-		ratio: Vec<Assignment<A, T>>,
+	pub fn assignment_ratio_to_staked_slice<A: IdentifierT, P: PerThing>(
+		ratio: Vec<Assignment<A, P>>,
 		stakes: &[VoteWeight],
 	) -> Vec<StakedAssignment<A>>
 	where
@@ -149,7 +149,10 @@ fn do_phragmen(
 		if eq_iters > 0 {
 			let staked = assignment_ratio_to_staked(assignments, &stake_of);
 			let winners = to_without_backing(winners);
-			let mut support = build_support_map(winners.as_ref(), staked.as_ref()).0;
+			let mut support = build_support_map(
+				winners.as_ref(),
+				staked.as_ref(),
+			).unwrap();
 
 			balance_solution(
 				staked.into_iter().map(|a| (a.clone(), stake_of(&a.who))).collect(),

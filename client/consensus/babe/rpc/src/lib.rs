@@ -32,13 +32,17 @@ use sp_consensus_babe::{
 	digests::PreDigest,
 };
 use serde::{Deserialize, Serialize};
-use sc_keystore::KeyStorePtr;
+use sp_core::{
+	crypto::Public,
+};
+use sp_application_crypto::AppKey;
+use sp_keystore::{SyncCryptoStorePtr, SyncCryptoStore};
 use sc_rpc_api::DenyUnsafe;
 use sp_api::{ProvideRuntimeApi, BlockId};
 use sp_runtime::traits::{Block as BlockT, Header as _};
 use sp_consensus::{SelectChain, Error as ConsensusError};
 use sp_blockchain::{HeaderBackend, HeaderMetadata, Error as BlockChainError};
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 type FutureResult<T> = Box<dyn rpc_future::Future<Item = T, Error = RpcError> + Send>;
 
@@ -58,7 +62,7 @@ pub struct BabeRpcHandler<B: BlockT, C, SC> {
 	/// shared reference to EpochChanges
 	shared_epoch_changes: SharedEpochChanges<B, Epoch>,
 	/// shared reference to the Keystore
-	keystore: KeyStorePtr,
+	keystore: SyncCryptoStorePtr,
 	/// config (actually holds the slot duration)
 	babe_config: Config,
 	/// The SelectChain strategy
@@ -72,7 +76,7 @@ impl<B: BlockT, C, SC> BabeRpcHandler<B, C, SC> {
 	pub fn new(
 		client: Arc<C>,
 		shared_epoch_changes: SharedEpochChanges<B, Epoch>,
-		keystore: KeyStorePtr,
+		keystore: SyncCryptoStorePtr,
 		babe_config: Config,
 		select_chain: SC,
 		deny_unsafe: DenyUnsafe,
@@ -93,7 +97,6 @@ impl<B, C, SC> BabeApi for BabeRpcHandler<B, C, SC>
 		B: BlockT,
 		C: ProvideRuntimeApi<B> + HeaderBackend<B> + HeaderMetadata<B, Error=BlockChainError> + 'static,
 		C::Api: BabeRuntimeApi<B>,
-		<C::Api as sp_api::ApiErrorExt>::Error: fmt::Debug,
 		SC: SelectChain<B> + Clone + 'static,
 {
 	fn epoch_authorship(&self) -> FutureResult<HashMap<AuthorityId, EpochAuthorship>> {
@@ -126,22 +129,22 @@ impl<B, C, SC> BabeApi for BabeRpcHandler<B, C, SC>
 
 			let mut claims: HashMap<AuthorityId, EpochAuthorship> = HashMap::new();
 
-			let key_pairs = {
-				let keystore = keystore.read();
+			let keys = {
 				epoch.authorities.iter()
 					.enumerate()
-					.flat_map(|(i, a)| {
-						keystore
-							.key_pair::<sp_consensus_babe::AuthorityPair>(&a.0)
-							.ok()
-							.map(|kp| (kp, i))
+					.filter_map(|(i, a)| {
+						if SyncCryptoStore::has_keys(&*keystore, &[(a.0.to_raw_vec(), AuthorityId::ID)]) {
+							Some((a.0.clone(), i))
+						} else {
+							None
+						}
 					})
 					.collect::<Vec<_>>()
 			};
 
 			for slot_number in epoch_start..epoch_end {
 				if let Some((claim, key)) =
-					authorship::claim_slot_using_key_pairs(slot_number, &epoch, &key_pairs)
+					authorship::claim_slot_using_keys(slot_number, &epoch, &keystore, &keys)
 				{
 					match claim {
 						PreDigest::Primary { .. } => {
@@ -231,18 +234,23 @@ mod tests {
 		TestClientBuilder,
 	};
 	use sp_application_crypto::AppPair;
-	use sp_keyring::Ed25519Keyring;
-	use sc_keystore::Store;
+	use sp_keyring::Sr25519Keyring;
+	use sp_core::{crypto::key_types::BABE};
+	use sp_keystore::{SyncCryptoStorePtr, SyncCryptoStore};
+	use sc_keystore::LocalKeystore;
 
 	use std::sync::Arc;
 	use sc_consensus_babe::{Config, block_import, AuthorityPair};
 	use jsonrpc_core::IoHandler;
 
 	/// creates keystore backed by a temp file
-	fn create_temp_keystore<P: AppPair>(authority: Ed25519Keyring) -> (KeyStorePtr, tempfile::TempDir) {
+	fn create_temp_keystore<P: AppPair>(
+		authority: Sr25519Keyring,
+	) -> (SyncCryptoStorePtr, tempfile::TempDir) {
 		let keystore_path = tempfile::tempdir().expect("Creates keystore path");
-		let keystore = Store::open(keystore_path.path(), None).expect("Creates keystore");
-		keystore.write().insert_ephemeral_from_seed::<P>(&authority.to_seed())
+		let keystore = Arc::new(LocalKeystore::open(keystore_path.path(), None)
+			.expect("Creates keystore"));
+		SyncCryptoStore::sr25519_generate_new(&*keystore, BABE, Some(&authority.to_seed()))
 			.expect("Creates authority key");
 
 		(keystore, keystore_path)
@@ -262,7 +270,7 @@ mod tests {
 		).expect("can initialize block-import");
 
 		let epoch_changes = link.epoch_changes().clone();
-		let keystore = create_temp_keystore::<AuthorityPair>(Ed25519Keyring::Alice).0;
+		let keystore = create_temp_keystore::<AuthorityPair>(Sr25519Keyring::Alice).0;
 
 		BabeRpcHandler::new(
 			client.clone(),

@@ -31,13 +31,12 @@ use sp_rpc::number;
 use sp_runtime::{
 	generic::BlockId,
 	traits::{Block as BlockT, Header as HeaderT},
+	DispatchError,
 };
 use std::convert::TryInto;
+use pallet_contracts_primitives::ContractExecResult;
 
-pub use self::gen_client::Client as ContractsClient;
-pub use pallet_contracts_rpc_runtime_api::{
-	self as runtime_api, ContractExecResult, ContractsApi as ContractsRuntimeApi,
-};
+pub use pallet_contracts_rpc_runtime_api::ContractsApi as ContractsRuntimeApi;
 
 const RUNTIME_ERROR: i64 = 1;
 const CONTRACT_DOESNT_EXIST: i64 = 2;
@@ -85,30 +84,47 @@ pub struct CallRequest<AccountId, Balance> {
 	input_data: Bytes,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct RpcContractExecSuccess {
+	/// The return flags. See `pallet_contracts_primitives::ReturnFlags`.
+	flags: u32,
+	/// Data as returned by the contract.
+	data: Bytes,
+}
+
 /// An RPC serializable result of contract execution
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
-pub enum RpcContractExecResult {
-	/// Successful execution
-	Success {
-		/// Status code
-		status: u8,
-		/// Output data
-		data: Bytes,
-	},
-	/// Error execution
-	Error(()),
+pub struct RpcContractExecResult {
+	/// How much gas was consumed by the call. In case of an error this is the amount
+	/// that was used up until the error occurred.
+	gas_consumed: u64,
+	/// Additional dynamic human readable error information for debugging. An empty string
+	/// indicates that no additional information is available.
+	debug_message: String,
+	/// Indicates whether the contract execution was successful or not.
+	result: std::result::Result<RpcContractExecSuccess, DispatchError>,
 }
 
 impl From<ContractExecResult> for RpcContractExecResult {
 	fn from(r: ContractExecResult) -> Self {
-		match r {
-			ContractExecResult::Success { status, data } => RpcContractExecResult::Success {
-				status,
-				data: data.into(),
+		match r.exec_result {
+			Ok(val) => RpcContractExecResult {
+				gas_consumed: r.gas_consumed,
+				debug_message: String::new(),
+				result: Ok(RpcContractExecSuccess {
+					flags: val.flags.bits(),
+					data: val.data.into(),
+				}),
 			},
-			ContractExecResult::Error => RpcContractExecResult::Error(()),
+			Err(err) => RpcContractExecResult {
+				gas_consumed: r.gas_consumed,
+				debug_message: String::new(),
+				result: Err(err.error),
+			},
 		}
 	}
 }
@@ -226,7 +242,7 @@ where
 
 		let exec_result = api
 			.call(&at, origin, dest, value, gas_limit, input_data.to_vec())
-			.map_err(|e| runtime_error_into_rpc_err(e))?;
+			.map_err(runtime_error_into_rpc_err)?;
 
 		Ok(exec_result.into())
 	}
@@ -244,7 +260,7 @@ where
 
 		let result = api
 			.get_storage(&at, address, key.into())
-			.map_err(|e| runtime_error_into_rpc_err(e))?
+			.map_err(runtime_error_into_rpc_err)?
 			.map_err(ContractAccessError)?
 			.map(Bytes);
 
@@ -263,7 +279,7 @@ where
 
 		let result = api
 			.rent_projection(&at, address)
-			.map_err(|e| runtime_error_into_rpc_err(e))?
+			.map_err(runtime_error_into_rpc_err)?
 			.map_err(ContractAccessError)?;
 
 		Ok(match result {
@@ -309,7 +325,7 @@ mod tests {
 			let actual = serde_json::to_string(&res).unwrap();
 			assert_eq!(actual, expected);
 		}
-		test(r#"{"success":{"status":5,"data":"0x1234"}}"#);
-		test(r#"{"error":null}"#);
+		test(r#"{"gasConsumed":5000,"debugMessage":"helpOk","result":{"Ok":{"flags":5,"data":"0x1234"}}}"#);
+		test(r#"{"gasConsumed":3400,"debugMessage":"helpErr","result":{"Err":"BadOrigin"}}"#);
 	}
 }

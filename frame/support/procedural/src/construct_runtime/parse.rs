@@ -149,9 +149,11 @@ impl Parse for WhereDefinition {
 	}
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModuleDeclaration {
 	pub name: Ident,
+	/// Optional fixed index (e.g. `MyPallet ...  = 3,`)
+	pub index: Option<u8>,
 	pub module: Ident,
 	pub instance: Option<Ident>,
 	pub module_parts: Vec<ModulePart>,
@@ -175,29 +177,24 @@ impl Parse for ModuleDeclaration {
 		let _: Token![::] = input.parse()?;
 		let module_parts = parse_module_parts(input)?;
 
+		let index = if input.peek(Token![=]) {
+			input.parse::<Token![=]>()?;
+			let index = input.parse::<syn::LitInt>()?;
+			let index = index.base10_parse::<u8>()?;
+			Some(index)
+		} else {
+			None
+		};
+
 		let parsed = Self {
 			name,
 			module,
 			instance,
 			module_parts,
+			index,
 		};
 
 		Ok(parsed)
-	}
-}
-
-impl ModuleDeclaration {
-	/// Get resolved module parts
-	pub fn module_parts(&self) -> &[ModulePart] {
-		&self.module_parts
-	}
-
-	pub fn find_part(&self, name: &str) -> Option<&ModulePart> {
-		self.module_parts.iter().find(|part| part.name() == name)
-	}
-
-	pub fn exists_part(&self, name: &str) -> bool {
-		self.find_part(name).is_some()
 	}
 }
 
@@ -279,18 +276,6 @@ impl ModulePartKeyword {
 		Ident::new(self.name(), self.span())
 	}
 
-	/// Returns `true` if this module part allows to have an argument.
-	///
-	/// For example `Inherent(Timestamp)`.
-	fn allows_arg(&self) -> bool {
-		Self::all_allow_arg().iter().any(|n| *n == self.name())
-	}
-
-	/// Returns the names of all module parts that allow to have an argument.
-	fn all_allow_arg() -> &'static [&'static str] {
-		&["Inherent"]
-	}
-
 	/// Returns `true` if this module part is allowed to have generic arguments.
 	fn allows_generic(&self) -> bool {
 		Self::all_generic_arg().iter().any(|n| *n == self.name())
@@ -321,7 +306,6 @@ impl Spanned for ModulePartKeyword {
 pub struct ModulePart {
 	pub keyword: ModulePartKeyword,
 	pub generics: syn::Generics,
-	pub args: Option<ext::Parens<ext::Punctuated<Ident, Token![,]>>>,
 }
 
 impl Parse for ModulePart {
@@ -339,27 +323,10 @@ impl Parse for ModulePart {
 			);
 			return Err(syn::Error::new(keyword.span(), msg));
 		}
-		let args = if input.peek(token::Paren) {
-			if !keyword.allows_arg() {
-				let syn::group::Parens { token: parens, .. } = syn::group::parse_parens(input)?;
-				let valid_names = ModulePart::format_names(ModulePartKeyword::all_allow_arg());
-				let msg = format!(
-					"`{}` is not allowed to have arguments in parens. \
-					 Only the following modules are allowed to have arguments in parens: {}.",
-					keyword.name(),
-					valid_names,
-				);
-				return Err(syn::Error::new(parens.span, msg));
-			}
-			Some(input.parse()?)
-		} else {
-			None
-		};
 
 		Ok(Self {
 			keyword,
 			generics,
-			args,
 		})
 	}
 }

@@ -19,6 +19,7 @@
 
 use sc_service::client::Client;
 use sc_client_api::backend::Finalizer;
+use sc_client_api::client::BlockBackend;
 use sp_consensus::{
 	BlockImportParams, BlockImport, BlockOrigin, Error as ConsensusError,
 	ForkChoiceStrategy,
@@ -78,7 +79,7 @@ impl<B, E, RA, Block> ClientExt<Block> for Client<B, E, Block, RA>
 	}
 
 	fn genesis_hash(&self) -> <Block as BlockT>::Hash {
-		self.block_hash(0.into()).unwrap().unwrap()
+		self.block_hash(0u32.into()).unwrap().unwrap()
 	}
 }
 

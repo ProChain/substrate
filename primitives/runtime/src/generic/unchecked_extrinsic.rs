@@ -27,9 +27,11 @@ use crate::{
 	},
 	generic::CheckedExtrinsic,
 	transaction_validity::{TransactionValidityError, InvalidTransaction},
+	OpaqueExtrinsic,
 };
 
-const TRANSACTION_VERSION: u8 = 4;
+/// Current version of the [`UncheckedExtrinsic`] format.
+const EXTRINSIC_VERSION: u8 = 4;
 
 /// A extrinsic right from the external world. This is unchecked and so
 /// can contain a signature.
@@ -150,7 +152,7 @@ impl<Address, Call, Signature, Extra> ExtrinsicMetadata
 		where
 			Extra: SignedExtension,
 {
-	const VERSION: u8 = TRANSACTION_VERSION;
+	const VERSION: u8 = EXTRINSIC_VERSION;
 	type SignedExtensions = Extra;
 }
 
@@ -232,7 +234,7 @@ where
 
 		let is_signed = version & 0b1000_0000 != 0;
 		let version = version & 0b0111_1111;
-		if version != TRANSACTION_VERSION {
+		if version != EXTRINSIC_VERSION {
 			return Err("Invalid transaction version".into());
 		}
 
@@ -256,11 +258,11 @@ where
 			// 1 byte version id.
 			match self.signature.as_ref() {
 				Some(s) => {
-					v.push(TRANSACTION_VERSION | 0b1000_0000);
+					v.push(EXTRINSIC_VERSION | 0b1000_0000);
 					s.encode_to(v);
 				}
 				None => {
-					v.push(TRANSACTION_VERSION & 0b0111_1111);
+					v.push(EXTRINSIC_VERSION & 0b0111_1111);
 				}
 			}
 			self.function.encode_to(v);
@@ -313,6 +315,23 @@ where
 			self.signature.as_ref().map(|x| (&x.0, &x.2)),
 			self.function,
 		)
+	}
+}
+
+impl<Address, Call, Signature, Extra> From<UncheckedExtrinsic<Address, Call, Signature, Extra>>
+	for OpaqueExtrinsic
+where
+	Address: Encode,
+	Signature: Encode,
+	Call: Encode,
+	Extra: SignedExtension,
+{
+	fn from(extrinsic: UncheckedExtrinsic<Address, Call, Signature, Extra>) -> Self {
+		OpaqueExtrinsic::from_bytes(extrinsic.encode().as_slice())
+			.expect(
+				"both OpaqueExtrinsic and UncheckedExtrinsic have encoding that is compatible with \
+				raw Vec<u8> encoding; qed"
+			)
 	}
 }
 
@@ -423,5 +442,14 @@ mod tests {
 		assert_eq!(decoded, ex);
 		let as_vec: Vec<u8> = Decode::decode(&mut encoded.as_slice()).unwrap();
 		assert_eq!(as_vec.encode(), encoded);
+	}
+
+	#[test]
+	fn conversion_to_opaque() {
+		let ux = Ex::new_unsigned(vec![0u8; 0]);
+		let encoded = ux.encode();
+		let opaque: OpaqueExtrinsic = ux.into();
+		let opaque_encoded = opaque.encode();
+		assert_eq!(opaque_encoded, encoded);
 	}
 }

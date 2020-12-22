@@ -19,7 +19,7 @@
 //! Substrate block builder
 //!
 //! This crate provides the [`BlockBuilder`] utility and the corresponding runtime api
-//! [`BlockBuilder`](sp_block_builder::BlockBuilder).Error
+//! [`BlockBuilder`](sp_block_builder::BlockBuilder).
 //!
 //! The block builder utility is used in the node as an abstraction over the runtime api to
 //! initialize a block, to push extrinsics and to finalize a block.
@@ -34,7 +34,10 @@ use sp_runtime::{
 };
 use sp_blockchain::{ApplyExtrinsicFailed, Error};
 use sp_core::ExecutionContext;
-use sp_api::{Core, ApiExt, ApiErrorFor, ApiRef, ProvideRuntimeApi, StorageChanges, StorageProof};
+use sp_api::{
+	Core, ApiExt, ApiErrorFor, ApiRef, ProvideRuntimeApi, StorageChanges, StorageProof,
+	TransactionOutcome,
+};
 use sp_consensus::RecordProof;
 
 pub use sp_block_builder::BlockBuilder as BlockBuilderApi;
@@ -156,17 +159,22 @@ where
 		let block_id = &self.block_id;
 		let extrinsics = &mut self.extrinsics;
 
-		self.api.map_api_result(|api| {
+		self.api.execute_in_transaction(|api| {
 			match api.apply_extrinsic_with_context(
 				block_id,
 				ExecutionContext::BlockConstruction,
 				xt.clone(),
-			)? {
-				Ok(_) => {
+			) {
+				Ok(Ok(_)) => {
 					extrinsics.push(xt);
-					Ok(())
+					TransactionOutcome::Commit(Ok(()))
 				}
-				Err(tx_validity) => Err(ApplyExtrinsicFailed::Validity(tx_validity).into()),
+				Ok(Err(tx_validity)) => {
+					TransactionOutcome::Rollback(
+						Err(ApplyExtrinsicFailed::Validity(tx_validity).into()),
+					)
+				},
+				Err(e) => TransactionOutcome::Rollback(Err(e)),
 			}
 		})
 	}
@@ -204,12 +212,31 @@ where
 			&state,
 			changes_trie_state.as_ref(),
 			parent_hash,
-		)?;
+		).map_err(|e| sp_blockchain::Error::StorageChanges(e))?;
 
 		Ok(BuiltBlock {
 			block: <Block as BlockT>::new(header, self.extrinsics),
 			storage_changes,
 			proof,
+		})
+	}
+
+	/// Create the inherents for the block.
+	///
+	/// Returns the inherents created by the runtime or an error if something failed.
+	pub fn create_inherents(
+		&mut self,
+		inherent_data: sp_inherents::InherentData,
+	) -> Result<Vec<Block::Extrinsic>, ApiErrorFor<A, Block>> {
+		let block_id = self.block_id;
+		self.api.execute_in_transaction(move |api| {
+			// `create_inherents` should not change any state, to ensure this we always rollback
+			// the transaction.
+			TransactionOutcome::Rollback(api.inherent_extrinsics_with_context(
+				&block_id,
+				ExecutionContext::BlockConstruction,
+				inherent_data
+			))
 		})
 	}
 }

@@ -23,28 +23,9 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use codec::{Codec, Decode, Encode};
-use pallet_contracts_primitives::{GetStorageResult, RentProjectionResult};
-use sp_runtime::RuntimeDebug;
+use codec::Codec;
 use sp_std::vec::Vec;
-
-/// A result of execution of a contract.
-#[derive(Eq, PartialEq, Encode, Decode, RuntimeDebug)]
-pub enum ContractExecResult {
-	/// The contract returned successfully.
-	///
-	/// There is a status code and, optionally, some data returned by the contract.
-	Success {
-		/// Status code returned by the contract.
-		status: u8,
-		/// Output data returned by the contract.
-		///
-		/// Can be empty.
-		data: Vec<u8>,
-	},
-	/// The contract execution either trapped or returned an error.
-	Error,
-}
+use pallet_contracts_primitives::{ContractExecResult, GetStorageResult, RentProjectionResult};
 
 sp_api::decl_runtime_apis! {
 	/// The API to interact with contracts without using executive.

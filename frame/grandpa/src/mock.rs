@@ -19,16 +19,13 @@
 
 #![cfg(test)]
 
-use crate::{
-	equivocation::ValidateEquivocationReport, AuthorityId, AuthorityList, Call as GrandpaCall,
-	ConsensusLog, Module, Trait,
-};
+use crate::{AuthorityId, AuthorityList, ConsensusLog, Module, Config};
 use ::grandpa as finality_grandpa;
 use codec::Encode;
 use frame_support::{
 	impl_outer_dispatch, impl_outer_event, impl_outer_origin, parameter_types,
 	traits::{KeyOwnerProofSystem, OnFinalize, OnInitialize},
-	weights::{DispatchInfo, Weight},
+	weights::Weight,
 };
 use pallet_staking::EraIndex;
 use sp_core::{crypto::KeyTypeId, H256};
@@ -39,21 +36,10 @@ use sp_runtime::{
 	curve::PiecewiseLinear,
 	impl_opaque_keys,
 	testing::{Header, TestXt, UintAuthorityId},
-	traits::{
-		Convert, Extrinsic as ExtrinsicT, Header as _, IdentityLookup, OpaqueKeys,
-		SaturatedConversion, SignedExtension,
-	},
-	transaction_validity::TransactionValidityError,
+	traits::{IdentityLookup, OpaqueKeys},
 	DigestItem, Perbill,
 };
 use sp_staking::SessionIndex;
-
-use frame_system as system;
-use pallet_balances as balances;
-use pallet_offences as offences;
-use pallet_session as session;
-use pallet_staking as staking;
-use pallet_timestamp as timestamp;
 
 impl_outer_origin! {
 	pub enum Origin for Test {}
@@ -61,8 +47,8 @@ impl_outer_origin! {
 
 impl_outer_dispatch! {
 	pub enum Call for Test where origin: Origin {
-		grandpa::Grandpa,
-		staking::Staking,
+		pallet_grandpa::Grandpa,
+		pallet_staking::Staking,
 	}
 }
 
@@ -74,12 +60,12 @@ impl_opaque_keys! {
 
 impl_outer_event! {
 	pub enum TestEvent for Test {
-		system<T>,
-		balances<T>,
-		grandpa,
-		offences,
-		session,
-		staking<T>,
+		frame_system<T>,
+		pallet_balances<T>,
+		pallet_grandpa,
+		pallet_offences,
+		pallet_session,
+		pallet_staking<T>,
 	}
 }
 
@@ -88,12 +74,15 @@ pub struct Test;
 
 parameter_types! {
 	pub const BlockHashCount: u64 = 250;
-	pub const MaximumBlockWeight: Weight = 1024;
-	pub const MaximumBlockLength: u32 = 2 * 1024;
-	pub const AvailableBlockRatio: Perbill = Perbill::one();
+	pub BlockWeights: frame_system::limits::BlockWeights =
+		frame_system::limits::BlockWeights::simple_max(1024);
 }
 
-impl frame_system::Trait for Test {
+impl frame_system::Config for Test {
+	type BaseCallFilter = ();
+	type BlockWeights = ();
+	type BlockLength = ();
+	type DbWeight = ();
 	type Origin = Origin;
 	type Index = u64;
 	type BlockNumber = u64;
@@ -105,21 +94,15 @@ impl frame_system::Trait for Test {
 	type Header = Header;
 	type Event = TestEvent;
 	type BlockHashCount = BlockHashCount;
-	type MaximumBlockWeight = MaximumBlockWeight;
-	type DbWeight = ();
-	type BlockExecutionWeight = ();
-	type ExtrinsicBaseWeight = ();
-	type MaximumExtrinsicWeight = MaximumBlockWeight;
-	type MaximumBlockLength = MaximumBlockLength;
-	type AvailableBlockRatio = AvailableBlockRatio;
 	type Version = ();
-	type ModuleToIndex = ();
-	type AccountData = balances::AccountData<u128>;
+	type PalletInfo = ();
+	type AccountData = pallet_balances::AccountData<u128>;
 	type OnNewAccount = ();
 	type OnKilledAccount = ();
+	type SystemWeightInfo = ();
 }
 
-impl<C> system::offchain::SendTransactionTypes<C> for Test
+impl<C> frame_system::offchain::SendTransactionTypes<C> for Test
 where
 	Call: From<C>,
 {
@@ -134,43 +117,58 @@ parameter_types! {
 }
 
 /// Custom `SessionHandler` since we use `TestSessionKeys` as `Keys`.
-impl session::Trait for Test {
+impl pallet_session::Config for Test {
 	type Event = TestEvent;
 	type ValidatorId = u64;
-	type ValidatorIdOf = staking::StashOf<Self>;
-	type ShouldEndSession = session::PeriodicSessions<Period, Offset>;
-	type NextSessionRotation = session::PeriodicSessions<Period, Offset>;
-	type SessionManager = session::historical::NoteHistoricalRoot<Self, Staking>;
+	type ValidatorIdOf = pallet_staking::StashOf<Self>;
+	type ShouldEndSession = pallet_session::PeriodicSessions<Period, Offset>;
+	type NextSessionRotation = pallet_session::PeriodicSessions<Period, Offset>;
+	type SessionManager = pallet_session::historical::NoteHistoricalRoot<Self, Staking>;
 	type SessionHandler = <TestSessionKeys as OpaqueKeys>::KeyTypeIdProviders;
 	type Keys = TestSessionKeys;
 	type DisabledValidatorsThreshold = DisabledValidatorsThreshold;
+	type WeightInfo = ();
 }
 
-impl session::historical::Trait for Test {
-	type FullIdentification = staking::Exposure<u64, u128>;
-	type FullIdentificationOf = staking::ExposureOf<Self>;
+impl pallet_session::historical::Config for Test {
+	type FullIdentification = pallet_staking::Exposure<u64, u128>;
+	type FullIdentificationOf = pallet_staking::ExposureOf<Self>;
+}
+
+parameter_types! {
+	pub const UncleGenerations: u64 = 0;
+}
+
+impl pallet_authorship::Config for Test {
+	type FindAuthor = ();
+	type UncleGenerations = UncleGenerations;
+	type FilterUncle = ();
+	type EventHandler = ();
 }
 
 parameter_types! {
 	pub const ExistentialDeposit: u128 = 1;
 }
 
-impl balances::Trait for Test {
+impl pallet_balances::Config for Test {
+	type MaxLocks = ();
 	type Balance = u128;
 	type DustRemoval = ();
 	type Event = TestEvent;
 	type ExistentialDeposit = ExistentialDeposit;
 	type AccountStore = System;
+	type WeightInfo = ();
 }
 
 parameter_types! {
 	pub const MinimumPeriod: u64 = 3;
 }
 
-impl timestamp::Trait for Test {
+impl pallet_timestamp::Config for Test {
 	type Moment = u64;
 	type OnTimestampSet = ();
 	type MinimumPeriod = MinimumPeriod;
+	type WeightInfo = ();
 }
 
 pallet_staking_reward_curve::build! {
@@ -195,23 +193,9 @@ parameter_types! {
 	pub const StakingUnsignedPriority: u64 = u64::max_value() / 2;
 }
 
-pub struct CurrencyToVoteHandler;
-
-impl Convert<u128, u128> for CurrencyToVoteHandler {
-	fn convert(x: u128) -> u128 {
-		x
-	}
-}
-
-impl Convert<u128, u64> for CurrencyToVoteHandler {
-	fn convert(x: u128) -> u64 {
-		x.saturated_into()
-	}
-}
-
-impl staking::Trait for Test {
+impl pallet_staking::Config for Test {
 	type RewardRemainder = ();
-	type CurrencyToVote = CurrencyToVoteHandler;
+	type CurrencyToVote = frame_support::traits::SaturatingCurrencyToVote;
 	type Event = TestEvent;
 	type Currency = Balances;
 	type Slash = ();
@@ -219,9 +203,9 @@ impl staking::Trait for Test {
 	type SessionsPerEra = SessionsPerEra;
 	type BondingDuration = BondingDuration;
 	type SlashDeferDuration = SlashDeferDuration;
-	type SlashCancelOrigin = system::EnsureRoot<Self::AccountId>;
+	type SlashCancelOrigin = frame_system::EnsureRoot<Self::AccountId>;
 	type SessionInterface = Self;
-	type UnixTime = timestamp::Module<Test>;
+	type UnixTime = pallet_timestamp::Module<Test>;
 	type RewardCurve = RewardCurve;
 	type MaxNominatorRewardedPerValidator = MaxNominatorRewardedPerValidator;
 	type NextNewSession = Session;
@@ -230,20 +214,22 @@ impl staking::Trait for Test {
 	type UnsignedPriority = StakingUnsignedPriority;
 	type MaxIterations = ();
 	type MinSolutionScoreBump = ();
+	type OffchainSolutionWeightLimit = ();
+	type WeightInfo = ();
 }
 
 parameter_types! {
-	pub OffencesWeightSoftLimit: Weight = Perbill::from_percent(60) * MaximumBlockWeight::get();
+	pub OffencesWeightSoftLimit: Weight = Perbill::from_percent(60) * BlockWeights::get().max_block;
 }
 
-impl offences::Trait for Test {
+impl pallet_offences::Config for Test {
 	type Event = TestEvent;
-	type IdentificationTuple = session::historical::IdentificationTuple<Self>;
+	type IdentificationTuple = pallet_session::historical::IdentificationTuple<Self>;
 	type OnOffenceHandler = Staking;
 	type WeightSoftLimit = OffencesWeightSoftLimit;
 }
 
-impl Trait for Test {
+impl Config for Test {
 	type Event = TestEvent;
 	type Call = Call;
 
@@ -257,69 +243,12 @@ impl Trait for Test {
 		AuthorityId,
 	)>>::IdentificationTuple;
 
-	type HandleEquivocation = super::EquivocationHandler<
-		Self::KeyOwnerIdentification,
-		reporting_keys::ReporterAppCrypto,
-		Test,
-		Offences,
-	>;
+	type HandleEquivocation = super::EquivocationHandler<Self::KeyOwnerIdentification, Offences>;
+
+	type WeightInfo = ();
 }
 
-pub mod reporting_keys {
-	use sp_core::crypto::KeyTypeId;
-
-	pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"test");
-
-	mod app {
-		use sp_application_crypto::{app_crypto, ed25519};
-		app_crypto!(ed25519, super::KEY_TYPE);
-
-		impl sp_runtime::traits::IdentifyAccount for Public {
-			type AccountId = u64;
-			fn into_account(self) -> Self::AccountId {
-				super::super::Grandpa::grandpa_authorities()
-					.iter()
-					.map(|(k, _)| k)
-					.position(|b| *b == self.0.clone().into())
-					.unwrap() as u64
-			}
-		}
-	}
-
-	pub type ReporterId = app::Public;
-
-	pub struct ReporterAppCrypto;
-	impl frame_system::offchain::AppCrypto<ReporterId, sp_core::ed25519::Signature>
-		for ReporterAppCrypto
-	{
-		type RuntimeAppPublic = ReporterId;
-		type GenericSignature = sp_core::ed25519::Signature;
-		type GenericPublic = sp_core::ed25519::Public;
-	}
-}
-
-type Extrinsic = TestXt<Call, ()>;
-
-impl<LocalCall> system::offchain::CreateSignedTransaction<LocalCall> for Test
-where
-	Call: From<LocalCall>,
-{
-	fn create_transaction<C: system::offchain::AppCrypto<Self::Public, Self::Signature>>(
-		call: Call,
-		_public: reporting_keys::ReporterId,
-		_account: <Test as system::Trait>::AccountId,
-		nonce: <Test as system::Trait>::Index,
-	) -> Option<(Call, <Extrinsic as ExtrinsicT>::SignaturePayload)> {
-		Some((call, (nonce, ())))
-	}
-}
-
-impl frame_system::offchain::SigningTypes for Test {
-	type Public = reporting_keys::ReporterId;
-	type Signature = sp_core::ed25519::Signature;
-}
-
-mod grandpa {
+mod pallet_grandpa {
 	pub use crate::Event;
 }
 
@@ -379,7 +308,7 @@ pub fn new_test_ext_raw_authorities(authorities: AuthorityList) -> sp_io::TestEx
 				i as u64,
 				i as u64 + 1000,
 				10_000,
-				staking::StakerStatus::<u64>::Validator,
+				pallet_staking::StakerStatus::<u64>::Validator,
 			)
 		})
 		.collect();
@@ -390,18 +319,18 @@ pub fn new_test_ext_raw_authorities(authorities: AuthorityList) -> sp_io::TestEx
 
 	// NOTE: this will initialize the grandpa authorities
 	// through OneSessionHandler::on_genesis_session
-	session::GenesisConfig::<Test> { keys: session_keys }
+	pallet_session::GenesisConfig::<Test> { keys: session_keys }
 		.assimilate_storage(&mut t)
 		.unwrap();
 
-	balances::GenesisConfig::<Test> { balances }
+	pallet_balances::GenesisConfig::<Test> { balances }
 		.assimilate_storage(&mut t)
 		.unwrap();
 
-	let staking_config = staking::GenesisConfig::<Test> {
+	let staking_config = pallet_staking::GenesisConfig::<Test> {
 		stakers,
 		validator_count: 8,
-		force_era: staking::Forcing::ForceNew,
+		force_era: pallet_staking::Forcing::ForceNew,
 		minimum_validator_count: 0,
 		invulnerables: vec![],
 		..Default::default()
@@ -413,34 +342,32 @@ pub fn new_test_ext_raw_authorities(authorities: AuthorityList) -> sp_io::TestEx
 }
 
 pub fn start_session(session_index: SessionIndex) {
-	let mut parent_hash = System::parent_hash();
-
 	for i in Session::current_index()..session_index {
+		System::on_finalize(System::block_number());
+		Session::on_finalize(System::block_number());
 		Staking::on_finalize(System::block_number());
-		System::set_block_number((i + 1).into());
-		Timestamp::set_timestamp(System::block_number() * 6000);
+		Grandpa::on_finalize(System::block_number());
 
-		// In order to be able to use `System::parent_hash()` in the tests
-		// we need to first get it via `System::finalize` and then set it
-		// the `System::initialize`. However, it is needed to be taken into
-		// consideration that finalizing will prune some data in `System`
-		// storage including old values `BlockHash` if that reaches above
-		// `BlockHashCount` capacity.
-		if System::block_number() > 1 {
+		let parent_hash = if System::block_number() > 1 {
 			let hdr = System::finalize();
-			parent_hash = hdr.hash();
-		}
+			hdr.hash()
+		} else {
+			System::parent_hash()
+		};
 
 		System::initialize(
 			&(i as u64 + 1),
 			&parent_hash,
 			&Default::default(),
-			&Default::default(),
 			Default::default(),
 		);
+		System::set_block_number((i + 1).into());
+		Timestamp::set_timestamp(System::block_number() * 6000);
 
-		Session::on_initialize(System::block_number());
 		System::on_initialize(System::block_number());
+		Session::on_initialize(System::block_number());
+		Staking::on_initialize(System::block_number());
+		Grandpa::on_initialize(System::block_number());
 	}
 
 	assert_eq!(Session::current_index(), session_index);
@@ -456,21 +383,8 @@ pub fn initialize_block(number: u64, parent_hash: H256) {
 		&number,
 		&parent_hash,
 		&Default::default(),
-		&Default::default(),
 		Default::default(),
 	);
-}
-
-pub fn report_equivocation(
-	equivocation_proof: sp_finality_grandpa::EquivocationProof<H256, u64>,
-	key_owner_proof: sp_session::MembershipProof,
-) -> Result<GrandpaCall<Test>, TransactionValidityError> {
-	let inner = GrandpaCall::report_equivocation(equivocation_proof, key_owner_proof);
-	let call = Call::Grandpa(inner.clone());
-
-	ValidateEquivocationReport::<Test>::new().validate(&0, &call, &DispatchInfo::default(), 0)?;
-
-	Ok(inner)
 }
 
 pub fn generate_equivocation_proof(

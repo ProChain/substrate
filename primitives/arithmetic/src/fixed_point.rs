@@ -17,7 +17,7 @@
 //! Decimal Fixed Point implementations for Substrate runtime.
 
 use sp_std::{ops::{self, Add, Sub, Mul, Div}, fmt::Debug, prelude::*, convert::{TryInto, TryFrom}};
-use codec::{Encode, Decode};
+use codec::{Encode, Decode, CompactAs};
 use crate::{
 	helpers_128bit::multiply_by_rational, PerThing,
 	traits::{
@@ -84,7 +84,7 @@ pub trait FixedPointNumber:
 	fn saturating_from_integer<N: FixedPointOperand>(int: N) -> Self {
 		let mut n: I129 = int.into();
 		n.value = n.value.saturating_mul(Self::DIV.saturated_into());
-		Self::from_inner(from_i129(n).unwrap_or(to_bound(int, 0)))
+		Self::from_inner(from_i129(n).unwrap_or_else(|| to_bound(int, 0)))
 	}
 
 	/// Creates `self` from an integer number `int`.
@@ -101,7 +101,7 @@ pub trait FixedPointNumber:
 		if d == D::zero() {
 			panic!("attempt to divide by zero")
 		}
-		Self::checked_from_rational(n, d).unwrap_or(to_bound(n, d))
+		Self::checked_from_rational(n, d).unwrap_or_else(|| to_bound(n, d))
 	}
 
 	/// Creates `self` from a rational number. Equal to `n / d`.
@@ -137,7 +137,7 @@ pub trait FixedPointNumber:
 	///
 	/// Returns `N::min` or `N::max` if the result does not fit in `N`.
 	fn saturating_mul_int<N: FixedPointOperand>(self, n: N) -> N {
-		self.checked_mul_int(n).unwrap_or(to_bound(self.into_inner(), n))
+		self.checked_mul_int(n).unwrap_or_else(|| to_bound(self.into_inner(), n))
 	}
 
 	/// Checked division for integer type `N`. Equal to `self / d`.
@@ -160,7 +160,7 @@ pub trait FixedPointNumber:
 		if d == N::zero() {
 			panic!("attempt to divide by zero")
 		}
-		self.checked_div_int(d).unwrap_or(to_bound(self.into_inner(), d))
+		self.checked_div_int(d).unwrap_or_else(|| to_bound(self.into_inner(), d))
 	}
 
 	/// Saturating multiplication for integer type `N`, adding the result back.
@@ -183,7 +183,7 @@ pub trait FixedPointNumber:
 		if inner >= Self::Inner::zero() {
 			self
 		} else {
-			Self::from_inner(inner.checked_neg().unwrap_or(Self::Inner::max_value()))
+			Self::from_inner(inner.checked_neg().unwrap_or_else(|| Self::Inner::max_value()))
 		}
 	}
 
@@ -214,12 +214,12 @@ pub trait FixedPointNumber:
 		self.into_inner() == Self::Inner::one()
 	}
 
-	/// Checks if the number is positive.
+	/// Returns `true` if `self` is positive and `false` if the number is zero or negative.
 	fn is_positive(self) -> bool {
-		self.into_inner() >= Self::Inner::zero()
+		self.into_inner() > Self::Inner::zero()
 	}
 
-	/// Checks if the number is negative.
+	/// Returns `true` if `self` is negative and `false` if the number is zero or positive.
 	fn is_negative(self) -> bool {
 		self.into_inner() < Self::Inner::zero()
 	}
@@ -301,7 +301,7 @@ impl<N: FixedPointOperand> From<N> for I129 {
 		if n < N::zero() {
 			let value: u128 = n.checked_neg()
 				.map(|n| n.unique_saturated_into())
-				.unwrap_or(N::max_value().unique_saturated_into().saturating_add(1));
+				.unwrap_or_else(|| N::max_value().unique_saturated_into().saturating_add(1));
 			I129 { value, negative: true }
 		} else {
 			I129 { value: n.unique_saturated_into(), negative: false }
@@ -342,7 +342,7 @@ macro_rules! implement_fixed {
 		/// A fixed point number representation in the range.
 		///
 		#[doc = $title]
-		#[derive(Encode, Decode, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+		#[derive(Encode, Decode, CompactAs, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 		pub struct $name($inner_type);
 
 		impl From<$inner_type> for $name {
@@ -372,6 +372,23 @@ macro_rules! implement_fixed {
 			}
 		}
 
+		impl $name {
+			/// const version of `FixedPointNumber::from_inner`.
+			pub const fn from_inner(inner: $inner_type) -> Self {
+				Self(inner)
+			}
+
+			#[cfg(any(feature = "std", test))]
+			pub fn from_fraction(x: f64) -> Self {
+				Self((x * (<Self as FixedPointNumber>::DIV as f64)) as $inner_type)
+			}
+
+			#[cfg(any(feature = "std", test))]
+			pub fn to_fraction(self) -> f64 {
+				self.0 as f64 / <Self as FixedPointNumber>::DIV as f64
+			}
+		}
+
 		impl Saturating for $name {
 			fn saturating_add(self, rhs: Self) -> Self {
 				Self(self.0.saturating_add(rhs.0))
@@ -382,7 +399,7 @@ macro_rules! implement_fixed {
 			}
 
 			fn saturating_mul(self, rhs: Self) -> Self {
-				self.checked_mul(&rhs).unwrap_or(to_bound(self.0, rhs.0))
+				self.checked_mul(&rhs).unwrap_or_else(|| to_bound(self.0, rhs.0))
 			}
 
 			fn saturating_pow(self, exp: usize) -> Self {
@@ -519,10 +536,10 @@ macro_rules! implement_fixed {
 			}
 		}
 
-		impl<P: PerThing> From<P> for $name {
+		impl<P: PerThing> From<P> for $name where P::Inner: FixedPointOperand {
 			fn from(p: P) -> Self {
-				let accuracy = P::ACCURACY.saturated_into();
-				let value = p.deconstruct().saturated_into();
+				let accuracy = P::ACCURACY;
+				let value = p.deconstruct();
 				$name::saturating_from_rational(value, accuracy)
 			}
 		}
@@ -1374,6 +1391,23 @@ macro_rules! implement_fixed {
 				assert_eq!(b.checked_div(&$name::zero()), None);
 				assert_eq!(c.checked_div(&$name::zero()), None);
 				assert_eq!(d.checked_div(&$name::zero()), None);
+			}
+
+			#[test]
+			fn is_positive_negative_works() {
+				let one = $name::one();
+				assert!(one.is_positive());
+				assert!(!one.is_negative());
+
+				let zero = $name::zero();
+				assert!(!zero.is_positive());
+				assert!(!zero.is_negative());
+
+				if $signed {
+					let minus_one = $name::saturating_from_integer(-1);
+					assert!(minus_one.is_negative());
+					assert!(!minus_one.is_positive());
+				}
 			}
 
 			#[test]

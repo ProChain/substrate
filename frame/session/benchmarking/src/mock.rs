@@ -19,7 +19,7 @@
 
 #![cfg(test)]
 
-use sp_runtime::traits::{Convert, SaturatedConversion, IdentityLookup};
+use sp_runtime::traits::IdentityLookup;
 use frame_support::{impl_outer_origin, impl_outer_dispatch, parameter_types};
 
 type AccountId = u64;
@@ -33,7 +33,7 @@ type Staking = pallet_staking::Module<Test>;
 type Session = pallet_session::Module<Test>;
 
 impl_outer_origin! {
-	pub enum Origin for Test  where system = frame_system {}
+	pub enum Origin for Test where system = frame_system {}
 }
 
 impl_outer_dispatch! {
@@ -42,22 +42,14 @@ impl_outer_dispatch! {
 	}
 }
 
-pub struct CurrencyToVoteHandler;
-impl Convert<u64, u64> for CurrencyToVoteHandler {
-	fn convert(x: u64) -> u64 {
-		x
-	}
-}
-impl Convert<u128, u64> for CurrencyToVoteHandler {
-	fn convert(x: u128) -> u64 {
-		x.saturated_into()
-	}
-}
-
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct Test;
 
-impl frame_system::Trait for Test {
+impl frame_system::Config for Test {
+	type BaseCallFilter = ();
+	type BlockWeights = ();
+	type BlockLength = ();
+	type DbWeight = ();
 	type Origin = Origin;
 	type Index = AccountIndex;
 	type BlockNumber = BlockNumber;
@@ -69,39 +61,36 @@ impl frame_system::Trait for Test {
 	type Header = sp_runtime::testing::Header;
 	type Event = ();
 	type BlockHashCount = ();
-	type MaximumBlockWeight = ();
-	type DbWeight = ();
-	type BlockExecutionWeight = ();
-	type ExtrinsicBaseWeight = ();
-	type MaximumExtrinsicWeight = ();
-	type AvailableBlockRatio = ();
-	type MaximumBlockLength = ();
 	type Version = ();
-	type ModuleToIndex = ();
+	type PalletInfo = ();
 	type AccountData = pallet_balances::AccountData<u64>;
 	type OnNewAccount = ();
-	type OnKilledAccount = (Balances,);
+	type OnKilledAccount = Balances;
+	type SystemWeightInfo = ();
 }
 parameter_types! {
 	pub const ExistentialDeposit: Balance = 10;
 }
-impl pallet_balances::Trait for Test {
+impl pallet_balances::Config for Test {
+	type MaxLocks = ();
 	type Balance = Balance;
 	type Event = ();
 	type DustRemoval = ();
 	type ExistentialDeposit = ExistentialDeposit;
 	type AccountStore = System;
+	type WeightInfo = ();
 }
 
 parameter_types! {
 	pub const MinimumPeriod: u64 = 5;
 }
-impl pallet_timestamp::Trait for Test {
+impl pallet_timestamp::Config for Test {
 	type Moment = u64;
 	type OnTimestampSet = ();
 	type MinimumPeriod = MinimumPeriod;
+	type WeightInfo = ();
 }
-impl pallet_session::historical::Trait for Test {
+impl pallet_session::historical::Config for Test {
 	type FullIdentification = pallet_staking::Exposure<AccountId, Balance>;
 	type FullIdentificationOf = pallet_staking::ExposureOf<Test>;
 }
@@ -127,7 +116,7 @@ impl pallet_session::SessionHandler<AccountId> for TestSessionHandler {
 	fn on_disabled(_: usize) {}
 }
 
-impl pallet_session::Trait for Test {
+impl pallet_session::Config for Test {
 	type SessionManager = pallet_session::historical::NoteHistoricalRoot<Test, Staking>;
 	type Keys = SessionKeys;
 	type ShouldEndSession = pallet_session::PeriodicSessions<(), ()>;
@@ -137,6 +126,7 @@ impl pallet_session::Trait for Test {
 	type ValidatorId = AccountId;
 	type ValidatorIdOf = pallet_staking::StashOf<Test>;
 	type DisabledValidatorsThreshold = ();
+	type WeightInfo = ();
 }
 pallet_staking_reward_curve::build! {
 	const I_NPOS: sp_runtime::curve::PiecewiseLinear<'static> = curve!(
@@ -163,10 +153,10 @@ impl<C> frame_system::offchain::SendTransactionTypes<C> for Test where
 	type Extrinsic = Extrinsic;
 }
 
-impl pallet_staking::Trait for Test {
+impl pallet_staking::Config for Test {
 	type Currency = Balances;
 	type UnixTime = pallet_timestamp::Module<Self>;
-	type CurrencyToVote = CurrencyToVoteHandler;
+	type CurrencyToVote = frame_support::traits::SaturatingCurrencyToVote;
 	type RewardRemainder = ();
 	type Event = ();
 	type Slash = ();
@@ -184,9 +174,11 @@ impl pallet_staking::Trait for Test {
 	type UnsignedPriority = UnsignedPriority;
 	type MaxIterations = ();
 	type MinSolutionScoreBump = ();
+	type OffchainSolutionWeightLimit = ();
+	type WeightInfo = ();
 }
 
-impl crate::Trait for Test {}
+impl crate::Config for Test {}
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
 	let t = frame_system::GenesisConfig::default().build_storage::<Test>().unwrap();

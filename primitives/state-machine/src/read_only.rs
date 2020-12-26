@@ -24,7 +24,7 @@ use std::{
 use crate::{Backend, StorageKey, StorageValue};
 use hash_db::Hasher;
 use sp_core::{
-	storage::ChildInfo,
+	storage::{ChildInfo, TrackedStorageKey},
 	traits::Externalities, Blake2Hasher,
 };
 use codec::Encode;
@@ -37,11 +37,13 @@ pub trait InspectState<H: Hasher, B: Backend<H>> {
 	///
 	/// Self will be set as read-only externalities and inspection
 	/// closure will be run against it.
-	fn inspect_with<F: FnOnce()>(&self, f: F);
+	///
+	/// Returns the result of the closure.
+	fn inspect_state<F: FnOnce() -> R, R>(&self, f: F) -> R;
 }
 
 impl<H: Hasher, B: Backend<H>> InspectState<H, B> for B {
-	fn inspect_with<F: FnOnce()>(&self, f: F) {
+	fn inspect_state<F: FnOnce() -> R, R>(&self, f: F) -> R {
 		ReadOnlyExternalities::from(self).execute_with(f)
 	}
 }
@@ -129,7 +131,8 @@ impl<'a, H: Hasher, B: 'a + Backend<H>> Externalities for ReadOnlyExternalities<
 	fn kill_child_storage(
 		&mut self,
 		_child_info: &ChildInfo,
-	) {
+		_limit: Option<u32>,
+	) -> bool {
 		unimplemented!("kill_child_storage is not supported in ReadOnlyExternalities")
 	}
 
@@ -170,9 +173,37 @@ impl<'a, H: Hasher, B: 'a + Backend<H>> Externalities for ReadOnlyExternalities<
 		unimplemented!("storage_changes_root is not supported in ReadOnlyExternalities")
 	}
 
+	fn storage_start_transaction(&mut self) {
+		unimplemented!("Transactions are not supported by ReadOnlyExternalities");
+	}
+
+	fn storage_rollback_transaction(&mut self) -> Result<(), ()> {
+		unimplemented!("Transactions are not supported by ReadOnlyExternalities");
+	}
+
+	fn storage_commit_transaction(&mut self) -> Result<(), ()> {
+		unimplemented!("Transactions are not supported by ReadOnlyExternalities");
+	}
+
 	fn wipe(&mut self) {}
 
 	fn commit(&mut self) {}
+
+	fn read_write_count(&self) -> (u32, u32, u32, u32) {
+		unimplemented!("read_write_count is not supported in ReadOnlyExternalities")
+	}
+
+	fn reset_read_write_count(&mut self) {
+		unimplemented!("reset_read_write_count is not supported in ReadOnlyExternalities")
+	}
+
+	fn get_whitelist(&self) -> Vec<TrackedStorageKey> {
+		unimplemented!("get_whitelist is not supported in ReadOnlyExternalities")
+	}
+
+	fn set_whitelist(&mut self, _: Vec<TrackedStorageKey>) {
+		unimplemented!("set_whitelist is not supported in ReadOnlyExternalities")
+	}
 }
 
 impl<'a, H: Hasher, B: 'a + Backend<H>> sp_externalities::ExtensionStore for ReadOnlyExternalities<'a, H, B> {

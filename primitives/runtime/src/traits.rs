@@ -34,8 +34,8 @@ use crate::transaction_validity::{
 };
 use crate::generic::{Digest, DigestItem};
 pub use sp_arithmetic::traits::{
-	AtLeast32Bit, UniqueSaturatedInto, UniqueSaturatedFrom, Saturating, SaturatedConversion,
-	Zero, One, Bounded, CheckedAdd, CheckedSub, CheckedMul, CheckedDiv,
+	AtLeast32Bit, AtLeast32BitUnsigned, UniqueSaturatedInto, UniqueSaturatedFrom, Saturating,
+	SaturatedConversion, Zero, One, Bounded, CheckedAdd, CheckedSub, CheckedMul, CheckedDiv,
 	CheckedShl, CheckedShr, IntegerSquareRoot
 };
 use sp_application_crypto::AppKey;
@@ -144,7 +144,7 @@ impl<
 }
 
 /// An error type that indicates that the origin is invalid.
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, RuntimeDebug)]
 pub struct BadOrigin;
 
 impl From<BadOrigin> for &'static str {
@@ -207,6 +207,44 @@ impl<T> Lookup for IdentityLookup<T> {
 	type Source = T;
 	type Target = T;
 	fn lookup(&self, x: T) -> Result<T, LookupError> { Ok(x) }
+}
+
+/// A lookup implementation returning the `AccountId` from a `MultiAddress`.
+pub struct AccountIdLookup<AccountId, AccountIndex>(PhantomData<(AccountId, AccountIndex)>);
+impl<AccountId, AccountIndex> StaticLookup for AccountIdLookup<AccountId, AccountIndex>
+where
+	AccountId: Codec + Clone + PartialEq + Debug,
+	AccountIndex: Codec + Clone + PartialEq + Debug,
+	crate::MultiAddress<AccountId, AccountIndex>: Codec,
+{
+	type Source = crate::MultiAddress<AccountId, AccountIndex>;
+	type Target = AccountId;
+	fn lookup(x: Self::Source) -> Result<Self::Target, LookupError> {
+		match x {
+			crate::MultiAddress::Id(i) => Ok(i),
+			_ => Err(LookupError),
+		}
+	}
+	fn unlookup(x: Self::Target) -> Self::Source {
+		crate::MultiAddress::Id(x)
+	}
+}
+
+/// Perform a StaticLookup where there are multiple lookup sources of the same type.
+impl<A, B> StaticLookup for (A, B)
+where
+	A: StaticLookup,
+	B: StaticLookup<Source = A::Source, Target = A::Target>,
+{
+	type Source = A::Source;
+	type Target = A::Target;
+
+	fn lookup(x: Self::Source) -> Result<Self::Target, LookupError> {
+		A::lookup(x.clone()).or_else(|_| B::lookup(x))
+	}
+	fn unlookup(x: Self::Target) -> Self::Source {
+		A::unlookup(x)
+	}
 }
 
 /// Extensible conversion trait. Generic over both source and destination types.
@@ -490,9 +528,8 @@ pub trait Header:
 	MaybeMallocSizeOf + 'static
 {
 	/// Header number.
-	type Number: Member + MaybeSerializeDeserialize + Debug + sp_std::hash::Hash
-		+ Copy + MaybeDisplay + AtLeast32Bit + Codec + sp_std::str::FromStr
-		+ MaybeMallocSizeOf;
+	type Number: Member + MaybeSerializeDeserialize + Debug + sp_std::hash::Hash + Copy +
+		MaybeDisplay + AtLeast32BitUnsigned + Codec + sp_std::str::FromStr + MaybeMallocSizeOf;
 	/// Header hash type
 	type Hash: Member + MaybeSerializeDeserialize + Debug + sp_std::hash::Hash + Ord
 		+ Copy + MaybeDisplay + Default + SimpleBitOps + Codec + AsRef<[u8]>
@@ -656,7 +693,7 @@ pub trait Dispatchable {
 	/// identifier for the caller. The origin can be empty in the case of an inherent extrinsic.
 	type Origin;
 	/// ...
-	type Trait;
+	type Config;
 	/// An opaque set of information attached to the transaction. This could be constructed anywhere
 	/// down the line in a runtime. The current Substrate runtime uses a struct with the same name
 	/// to represent the dispatch class and weight.
@@ -675,7 +712,7 @@ pub type PostDispatchInfoOf<T> = <T as Dispatchable>::PostInfo;
 
 impl Dispatchable for () {
 	type Origin = ();
-	type Trait = ();
+	type Config = ();
 	type Info = ();
 	type PostInfo = ();
 	fn dispatch(self, _origin: Self::Origin) -> crate::DispatchResultWithInfo<Self::PostInfo> {

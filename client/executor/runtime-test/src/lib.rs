@@ -4,13 +4,20 @@
 #[cfg(feature = "std")]
 include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 
+/// Wasm binary unwrapped. If built with `SKIP_WASM_BUILD`, the function panics.
+#[cfg(feature = "std")]
+pub fn wasm_binary_unwrap() -> &'static [u8] {
+	WASM_BINARY.expect("Development wasm binary is not available. Testing is only \
+						supported with the flag disabled.")
+}
+
 #[cfg(not(feature = "std"))]
 use sp_std::{vec::Vec, vec};
 
 #[cfg(not(feature = "std"))]
 use sp_io::{
 	storage, hashing::{blake2_128, blake2_256, sha2_256, twox_128, twox_256},
-	crypto::{ed25519_verify, sr25519_verify},
+	crypto::{ed25519_verify, sr25519_verify}, wasm_tracing,
 };
 #[cfg(not(feature = "std"))]
 use sp_runtime::{print, traits::{BlakeTwo256, Hash}};
@@ -246,6 +253,25 @@ sp_core::wasm_export_functions! {
 		sp_allocator::FreeingBumpHeapAllocator::new(0);
 	}
 
+	fn test_enter_span() -> u64 {
+		wasm_tracing::enter_span(Default::default())
+	}
+
+	fn test_exit_span(span_id: u64) {
+		wasm_tracing::exit(span_id)
+	}
+
+	fn test_nested_spans() {
+		sp_io::init_tracing();
+		let span_id = wasm_tracing::enter_span(Default::default());
+		{
+			sp_io::init_tracing();
+			let span_id = wasm_tracing::enter_span(Default::default());
+			wasm_tracing::exit(span_id);
+		}
+		wasm_tracing::exit(span_id);
+	}
+
 	fn returns_mutable_static() -> u64 {
 		unsafe {
 			MUTABLE_STATIC += 1;
@@ -293,6 +319,43 @@ sp_core::wasm_export_functions! {
 
 		assert_ne!(test_message, message_slice);
 		message_slice.copy_from_slice(test_message);
+	}
+
+	fn test_spawn() {
+		let data = vec![1u8, 2u8];
+		let data_new = sp_tasks::spawn(tasks::incrementer, data).join();
+
+		assert_eq!(data_new, vec![2u8, 3u8]);
+	}
+
+	fn test_nested_spawn() {
+		let data = vec![7u8, 13u8];
+		let data_new = sp_tasks::spawn(tasks::parallel_incrementer, data).join();
+
+		assert_eq!(data_new, vec![10u8, 16u8]);
+	}
+
+	fn test_panic_in_spawned() {
+		sp_tasks::spawn(tasks::panicker, vec![]).join();
+	}
+ }
+
+ #[cfg(not(feature = "std"))]
+ mod tasks {
+	use sp_std::prelude::*;
+
+	pub fn incrementer(data: Vec<u8>) -> Vec<u8> {
+	   data.into_iter().map(|v| v + 1).collect()
+	}
+
+	pub fn panicker(_: Vec<u8>) -> Vec<u8> {
+		panic!()
+	}
+
+	pub fn parallel_incrementer(data: Vec<u8>) -> Vec<u8> {
+	   let first = data.into_iter().map(|v| v + 2).collect::<Vec<_>>();
+	   let second = sp_tasks::spawn(incrementer, first).join();
+	   second
 	}
  }
 
@@ -345,7 +408,7 @@ fn execute_sandboxed(
 				Memory::new() can't return a Error qed"
 			),
 		};
-		env_builder.add_memory("env", "memory", memory.clone());
+		env_builder.add_memory("env", "memory", memory);
 		env_builder
 	};
 

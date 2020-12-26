@@ -17,13 +17,15 @@
 
 //! # Nicks Module
 //!
-//! - [`nicks::Trait`](./trait.Trait.html)
+//! - [`nicks::Config`](./trait.Config.html)
 //! - [`Call`](./enum.Call.html)
 //!
 //! ## Overview
 //!
-//! Nicks is a trivial module for keeping track of account names on-chain. It makes no effort to
-//! create a name hierarchy, be a DNS replacement or provide reverse lookups.
+//! Nicks is an example module for keeping track of account names on-chain. It makes no effort to
+//! create a name hierarchy, be a DNS replacement or provide reverse lookups. Furthermore, the
+//! weights attached to this module's dispatchable functions are for demonstration purposes only and
+//! have not been designed to be economically secure. Do not use this pallet as-is in production.
 //!
 //! ## Interface
 //!
@@ -35,7 +37,7 @@
 //! * `kill_name` - Forcibly remove the associated name; the deposit is lost.
 //!
 //! [`Call`]: ./enum.Call.html
-//! [`Trait`]: ./trait.Trait.html
+//! [`Config`]: ./trait.Config.html
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -47,14 +49,14 @@ use frame_support::{
 	decl_module, decl_event, decl_storage, ensure, decl_error,
 	traits::{Currency, EnsureOrigin, ReservableCurrency, OnUnbalanced, Get},
 };
-use frame_system::{self as system, ensure_signed};
+use frame_system::ensure_signed;
 
-type BalanceOf<T> = <<T as Trait>::Currency as Currency<<T as frame_system::Trait>::AccountId>>::Balance;
-type NegativeImbalanceOf<T> = <<T as Trait>::Currency as Currency<<T as frame_system::Trait>::AccountId>>::NegativeImbalance;
+type BalanceOf<T> = <<T as Config>::Currency as Currency<<T as frame_system::Config>::AccountId>>::Balance;
+type NegativeImbalanceOf<T> = <<T as Config>::Currency as Currency<<T as frame_system::Config>::AccountId>>::NegativeImbalance;
 
-pub trait Trait: frame_system::Trait {
+pub trait Config: frame_system::Config {
 	/// The overarching event type.
-	type Event: From<Event<Self>> + Into<<Self as frame_system::Trait>::Event>;
+	type Event: From<Event<Self>> + Into<<Self as frame_system::Config>::Event>;
 
 	/// The currency trait.
 	type Currency: ReservableCurrency<Self::AccountId>;
@@ -76,30 +78,30 @@ pub trait Trait: frame_system::Trait {
 }
 
 decl_storage! {
-	trait Store for Module<T: Trait> as Nicks {
+	trait Store for Module<T: Config> as Nicks {
 		/// The lookup table for names.
 		NameOf: map hasher(twox_64_concat) T::AccountId => Option<(Vec<u8>, BalanceOf<T>)>;
 	}
 }
 
 decl_event!(
-	pub enum Event<T> where AccountId = <T as frame_system::Trait>::AccountId, Balance = BalanceOf<T> {
-		/// A name was set.
+	pub enum Event<T> where AccountId = <T as frame_system::Config>::AccountId, Balance = BalanceOf<T> {
+		/// A name was set. \[who\]
 		NameSet(AccountId),
-		/// A name was forcibly set.
+		/// A name was forcibly set. \[target\]
 		NameForced(AccountId),
-		/// A name was changed.
+		/// A name was changed. \[who\]
 		NameChanged(AccountId),
-		/// A name was cleared, and the given balance returned.
+		/// A name was cleared, and the given balance returned. \[who, deposit\]
 		NameCleared(AccountId, Balance),
-		/// A name was removed and the given balance slashed.
+		/// A name was removed and the given balance slashed. \[target, deposit\]
 		NameKilled(AccountId, Balance),
 	}
 );
 
 decl_error! {
 	/// Error for the nicks module.
-	pub enum Error for Module<T: Trait> {
+	pub enum Error for Module<T: Config> {
 		/// A name is too short.
 		TooShort,
 		/// A name is too long.
@@ -111,7 +113,7 @@ decl_error! {
 
 decl_module! {
 	/// Nicks module declaration.
-	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
+	pub struct Module<T: Config> for enum Call where origin: T::Origin {
 		type Error = Error<T>;
 
 		fn deposit_event() = default;
@@ -149,12 +151,12 @@ decl_module! {
 			ensure!(name.len() <= T::MaxLength::get(), Error::<T>::TooLong);
 
 			let deposit = if let Some((_, deposit)) = <NameOf<T>>::get(&sender) {
-				Self::deposit_event(RawEvent::NameSet(sender.clone()));
+				Self::deposit_event(RawEvent::NameChanged(sender.clone()));
 				deposit
 			} else {
 				let deposit = T::ReservationFee::get();
 				T::Currency::reserve(&sender, deposit.clone())?;
-				Self::deposit_event(RawEvent::NameChanged(sender.clone()));
+				Self::deposit_event(RawEvent::NameSet(sender.clone()));
 				deposit
 			};
 
@@ -187,7 +189,7 @@ decl_module! {
 		/// Fails if `who` has not been named. The deposit is dealt with through `T::Slashed`
 		/// imbalance handler.
 		///
-		/// The dispatch origin for this call must be _Root_ or match `T::ForceOrigin`.
+		/// The dispatch origin for this call must match `T::ForceOrigin`.
 		///
 		/// # <weight>
 		/// - O(1).
@@ -213,7 +215,7 @@ decl_module! {
 		///
 		/// No length checking is done on the name.
 		///
-		/// The dispatch origin for this call must be _Root_ or match `T::ForceOrigin`.
+		/// The dispatch origin for this call must match `T::ForceOrigin`.
 		///
 		/// # <weight>
 		/// - O(1).
@@ -239,33 +241,31 @@ mod tests {
 	use super::*;
 
 	use frame_support::{
-		assert_ok, assert_noop, impl_outer_origin, parameter_types, weights::Weight,
+		assert_ok, assert_noop, impl_outer_origin, parameter_types,
 		ord_parameter_types
 	};
 	use sp_core::H256;
 	use frame_system::EnsureSignedBy;
-	// The testing primitives are very useful for avoiding having to work with signatures
-	// or public keys. `u64` is used as the `AccountId` and no `Signature`s are required.
 	use sp_runtime::{
-		Perbill, testing::Header, traits::{BlakeTwo256, IdentityLookup, BadOrigin},
+		testing::Header, traits::{BlakeTwo256, IdentityLookup, BadOrigin},
 	};
 
 	impl_outer_origin! {
-		pub enum Origin for Test  where system = frame_system {}
+		pub enum Origin for Test where system = frame_system {}
 	}
 
-	// For testing the pallet, we construct most of a mock runtime. This means
-	// first constructing a configuration type (`Test`) which `impl`s each of the
-	// configuration traits of pallets we want to use.
 	#[derive(Clone, Eq, PartialEq)]
 	pub struct Test;
 	parameter_types! {
 		pub const BlockHashCount: u64 = 250;
-		pub const MaximumBlockWeight: Weight = 1024;
-		pub const MaximumBlockLength: u32 = 2 * 1024;
-		pub const AvailableBlockRatio: Perbill = Perbill::one();
+		pub BlockWeights: frame_system::limits::BlockWeights =
+			frame_system::limits::BlockWeights::simple_max(1024);
 	}
-	impl frame_system::Trait for Test {
+	impl frame_system::Config for Test {
+		type BaseCallFilter = ();
+		type BlockWeights = ();
+		type BlockLength = ();
+		type DbWeight = ();
 		type Origin = Origin;
 		type Index = u64;
 		type BlockNumber = u64;
@@ -277,28 +277,24 @@ mod tests {
 		type Header = Header;
 		type Event = ();
 		type BlockHashCount = BlockHashCount;
-		type MaximumBlockWeight = MaximumBlockWeight;
-		type DbWeight = ();
-		type BlockExecutionWeight = ();
-		type ExtrinsicBaseWeight = ();
-		type MaximumExtrinsicWeight = MaximumBlockWeight;
-		type MaximumBlockLength = MaximumBlockLength;
-		type AvailableBlockRatio = AvailableBlockRatio;
 		type Version = ();
-		type ModuleToIndex = ();
+		type PalletInfo = ();
 		type AccountData = pallet_balances::AccountData<u64>;
 		type OnNewAccount = ();
 		type OnKilledAccount = ();
+		type SystemWeightInfo = ();
 	}
 	parameter_types! {
 		pub const ExistentialDeposit: u64 = 1;
 	}
-	impl pallet_balances::Trait for Test {
+	impl pallet_balances::Config for Test {
+		type MaxLocks = ();
 		type Balance = u64;
 		type Event = ();
 		type DustRemoval = ();
 		type ExistentialDeposit = ExistentialDeposit;
 		type AccountStore = System;
+		type WeightInfo = ();
 	}
 	parameter_types! {
 		pub const ReservationFee: u64 = 2;
@@ -308,7 +304,7 @@ mod tests {
 	ord_parameter_types! {
 		pub const One: u64 = 1;
 	}
-	impl Trait for Test {
+	impl Config for Test {
 		type Event = ();
 		type Currency = Balances;
 		type ReservationFee = ReservationFee;
@@ -321,11 +317,8 @@ mod tests {
 	type Balances = pallet_balances::Module<Test>;
 	type Nicks = Module<Test>;
 
-	// This function basically just builds a genesis storage key/value store according to
-	// our desired mockup.
 	fn new_test_ext() -> sp_io::TestExternalities {
 		let mut t = frame_system::GenesisConfig::default().build_storage::<Test>().unwrap();
-		// We use default for brevity, but you can configure as desired if needed.
 		pallet_balances::GenesisConfig::<Test> {
 			balances: vec![
 				(1, 10),

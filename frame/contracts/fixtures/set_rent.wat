@@ -1,15 +1,14 @@
 (module
-	(import "env" "ext_dispatch_call" (func $ext_dispatch_call (param i32 i32)))
-	(import "env" "ext_set_storage" (func $ext_set_storage (param i32 i32 i32)))
-	(import "env" "ext_clear_storage" (func $ext_clear_storage (param i32)))
-	(import "env" "ext_set_rent_allowance" (func $ext_set_rent_allowance (param i32 i32)))
-	(import "env" "ext_scratch_size" (func $ext_scratch_size (result i32)))
-	(import "env" "ext_scratch_read" (func $ext_scratch_read (param i32 i32 i32)))
+	(import "seal0" "seal_transfer" (func $seal_transfer (param i32 i32 i32 i32) (result i32)))
+	(import "seal0" "seal_set_storage" (func $seal_set_storage (param i32 i32 i32)))
+	(import "seal0" "seal_clear_storage" (func $seal_clear_storage (param i32)))
+	(import "seal0" "seal_set_rent_allowance" (func $seal_set_rent_allowance (param i32 i32)))
+	(import "seal0" "seal_input" (func $seal_input (param i32 i32)))
 	(import "env" "memory" (memory 1 1))
 
 	;; insert a value of 4 bytes into storage
 	(func $call_0
-		(call $ext_set_storage
+		(call $seal_set_storage
 			(i32.const 1)
 			(i32.const 0)
 			(i32.const 4)
@@ -18,16 +17,18 @@
 
 	;; remove the value inserted by call_1
 	(func $call_1
-		(call $ext_clear_storage
+		(call $seal_clear_storage
 			(i32.const 1)
 		)
 	)
 
-	;; transfer 50 to ALICE
+	;; transfer 50 to CHARLIE
 	(func $call_2
-		(call $ext_dispatch_call
-			(i32.const 68)
-			(i32.const 11)
+		(call $assert
+			(i32.eq
+				(call $seal_transfer (i32.const 136) (i32.const 32) (i32.const 100) (i32.const 8))
+				(i32.const 0)
+			)
 		)
 	)
 
@@ -46,8 +47,11 @@
 	;; Dispatch the call according to input size
 	(func (export "call")
 		(local $input_size i32)
+		;; 4 byte i32 for br_table followed by 32 byte destination for transfer
+		(i32.store (i32.const 128) (i32.const 36))
+		(call $seal_input (i32.const 132) (i32.const 128))
 		(set_local $input_size
-			(call $ext_scratch_size)
+			(i32.load (i32.const 132))
 		)
 		(block $IF_ELSE
 			(block $IF_2
@@ -73,29 +77,29 @@
 	;; Set into storage a 4 bytes value
 	;; Set call set_rent_allowance with input
 	(func (export "deploy")
-		(local $input_size i32)
-		(set_local $input_size
-			(call $ext_scratch_size)
-		)
-		(call $ext_set_storage
+		(call $seal_set_storage
 			(i32.const 0)
 			(i32.const 0)
 			(i32.const 4)
 		)
-		(call $ext_scratch_read
-			(i32.const 0)
-			(i32.const 0)
-			(get_local $input_size)
+		(i32.store (i32.const 128) (i32.const 64))
+		(call $seal_input
+			(i32.const 104)
+			(i32.const 100)
 		)
-		(call $ext_set_rent_allowance
-			(i32.const 0)
-			(get_local $input_size)
+		(call $seal_set_rent_allowance
+			(i32.const 104)
+			(i32.load (i32.const 128))
 		)
 	)
 
 	;; Encoding of 10 in balance
 	(data (i32.const 0) "\28")
 
-	;; Encoding of call transfer 50 to CHARLIE
-	(data (i32.const 68) "\00\00\03\00\00\00\00\00\00\00\C8")
+	;; encoding of 50 balance
+	(data (i32.const 100) "\32")
+
+	;; [128, 132) size of seal input buffer
+
+	;; [132, inf) output buffer for seal input
 )

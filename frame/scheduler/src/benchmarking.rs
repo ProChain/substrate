@@ -28,21 +28,22 @@ use frame_benchmarking::benchmarks;
 use crate::Module as Scheduler;
 use frame_system::Module as System;
 
-const MAX_SCHEDULED: u32 = 50;
+const BLOCK_NUMBER: u32 = 2;
 
 // Add `n` named items to the schedule
-fn fill_schedule<T: Trait> (when: T::BlockNumber, n: u32) -> Result<(), &'static str> {
+fn fill_schedule<T: Config> (when: T::BlockNumber, n: u32) -> Result<(), &'static str> {
 	// Essentially a no-op call.
 	let call = frame_system::Call::set_storage(vec![]);
 	for i in 0..n {
 		// Named schedule is strictly heavier than anonymous
 		Scheduler::<T>::do_schedule_named(
 			i.encode(),
-			when,
+			DispatchTime::At(when),
 			// Add periodicity
 			Some((T::BlockNumber::one(), 100)),
 			// HARD_DEADLINE priority means it gets executed no matter what
 			0,
+			frame_system::RawOrigin::Root.into(),
 			call.clone().into(),
 		)?;
 	}
@@ -54,8 +55,8 @@ benchmarks! {
 	_ { }
 
 	schedule {
-		let s in 0 .. MAX_SCHEDULED;
-		let when = T::BlockNumber::one();
+		let s in 0 .. T::MaxScheduledPerBlock::get();
+		let when = BLOCK_NUMBER.into();
 		let periodic = Some((T::BlockNumber::one(), 100));
 		let priority = 0;
 		// Essentially a no-op call.
@@ -71,8 +72,8 @@ benchmarks! {
 	}
 
 	cancel {
-		let s in 1 .. MAX_SCHEDULED;
-		let when: T::BlockNumber = 2.into();
+		let s in 1 .. T::MaxScheduledPerBlock::get();
+		let when = BLOCK_NUMBER.into();
 
 		fill_schedule::<T>(when, s)?;
 		assert_eq!(Agenda::<T>::get(when).len(), s as usize);
@@ -90,9 +91,9 @@ benchmarks! {
 	}
 
 	schedule_named {
-		let s in 0 .. MAX_SCHEDULED;
+		let s in 0 .. T::MaxScheduledPerBlock::get();
 		let id = s.encode();
-		let when = T::BlockNumber::one();
+		let when = BLOCK_NUMBER.into();
 		let periodic = Some((T::BlockNumber::one(), 100));
 		let priority = 0;
 		// Essentially a no-op call.
@@ -108,8 +109,8 @@ benchmarks! {
 	}
 
 	cancel_named {
-		let s in 1 .. MAX_SCHEDULED;
-		let when = T::BlockNumber::one();
+		let s in 1 .. T::MaxScheduledPerBlock::get();
+		let when = BLOCK_NUMBER.into();
 
 		fill_schedule::<T>(when, s)?;
 	}: _(RawOrigin::Root, 0.encode())
@@ -125,11 +126,13 @@ benchmarks! {
 		);
 	}
 
+	// TODO [#7141]: Make this more complex and flexible so it can be used in automation.
+	#[extra]
 	on_initialize {
-		let s in 0 .. MAX_SCHEDULED;
-		let when = T::BlockNumber::one();
+		let s in 0 .. T::MaxScheduledPerBlock::get();
+		let when = BLOCK_NUMBER.into();
 		fill_schedule::<T>(when, s)?;
-	}: { Scheduler::<T>::on_initialize(T::BlockNumber::one()); }
+	}: { Scheduler::<T>::on_initialize(BLOCK_NUMBER.into()); }
 	verify {
 		assert_eq!(System::<T>::event_count(), s);
 		// Next block should have all the schedules again

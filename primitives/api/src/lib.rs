@@ -58,7 +58,7 @@ pub use sp_runtime::{
 		Block as BlockT, GetNodeBlockType, GetRuntimeBlockType, HashFor, NumberFor,
 		Header as HeaderT, Hash as HashT,
 	},
-	generic::BlockId, transaction_validity::TransactionValidity, RuntimeString,
+	generic::BlockId, transaction_validity::TransactionValidity, RuntimeString, TransactionOutcome,
 };
 #[doc(hidden)]
 pub use sp_core::{offchain, ExecutionContext};
@@ -69,10 +69,14 @@ pub use sp_std::{slice, mem};
 #[cfg(feature = "std")]
 use sp_std::result;
 #[doc(hidden)]
-pub use codec::{Encode, Decode};
+pub use codec::{Encode, Decode, DecodeLimit};
 use sp_core::OpaqueMetadata;
 #[cfg(feature = "std")]
 use std::{panic::UnwindSafe, cell::RefCell};
+
+
+/// Maximum nesting level for extrinsics.
+pub const MAX_EXTRINSIC_DEPTH: u32 = 256;
 
 /// Declares given traits as runtime apis.
 ///
@@ -238,20 +242,18 @@ pub use sp_api_proc_macro::impl_runtime_apis;
 
 /// Mocks given trait implementations as runtime apis.
 ///
-/// Accepts similar syntax as [`impl_runtime_apis!`](macro.impl_runtime_apis.html) and generates
+/// Accepts similar syntax as [`impl_runtime_apis!`] and generates
 /// simplified mock implementations of the given runtime apis. The difference in syntax is that the
 /// trait does not need to be referenced by a qualified path, methods accept the `&self` parameter
-/// and the error type can be specified as associated type. If no error type is specified `String`
+/// and the error type can be specified as associated type. If no error type is specified [`String`]
 /// is used as error type.
 ///
-/// Besides implementing the given traits, the [`Core`], [`ApiExt`] and [`ApiErrorExt`] are
-/// implemented automatically.
+/// Besides implementing the given traits, the [`Core`](sp_api::Core), [`ApiExt`](sp_api::ApiExt)
+/// and [`ApiErrorExt`](sp_api::ApiErrorExt) are implemented automatically.
 ///
 /// # Example
 ///
 /// ```rust
-/// use sp_version::create_runtime_str;
-/// #
 /// # use sp_runtime::traits::Block as BlockT;
 /// # use sp_test_primitives::Block;
 /// #
@@ -267,7 +269,6 @@ pub use sp_api_proc_macro::impl_runtime_apis;
 /// #        fn build_block() -> Block;
 /// #     }
 /// # }
-///
 /// struct MockApi {
 ///     balance: u64,
 /// }
@@ -288,10 +289,64 @@ pub use sp_api_proc_macro::impl_runtime_apis;
 ///         /// Sets the error type that is being used by the mock implementation.
 ///         /// The error type is used by all runtime apis. It is only required to
 ///         /// be specified in one trait implementation.
-///         type Error = String;
+///         type Error = sp_api::ApiError;
 ///
 ///         fn build_block() -> Block {
 ///              unimplemented!("Not Required in tests")
+///         }
+///     }
+/// }
+///
+/// # fn main() {}
+/// ```
+///
+/// # `advanced` attribute
+///
+/// This attribute can be placed above individual function in the mock implementation to request
+/// more control over the function declaration. From the client side each runtime api function is
+/// called with the `at` parameter that is a [`BlockId`](sp_api::BlockId). When using the `advanced`
+/// attribute, the macro expects that the first parameter of the function is this `at` parameter.
+/// Besides that the macro also doesn't do the automatic return value rewrite, which means that full
+/// return value must be specified. The full return value is constructed like
+/// [`Result`]`<`[`NativeOrEncoded`](sp_api::NativeOrEncoded)`<ReturnValue>, Error>` while
+/// `ReturnValue` being the return value that is specified in the trait declaration.
+///
+/// ## Example
+/// ```rust
+/// # use sp_runtime::{traits::Block as BlockT, generic::BlockId};
+/// # use sp_test_primitives::Block;
+/// # use sp_core::NativeOrEncoded;
+/// # use codec;
+/// #
+/// # sp_api::decl_runtime_apis! {
+/// #     /// Declare the api trait.
+/// #     pub trait Balance {
+/// #         /// Get the balance.
+/// #         fn get_balance() -> u64;
+/// #         /// Set the balance.
+/// #         fn set_balance(val: u64);
+/// #     }
+/// # }
+/// struct MockApi {
+///     balance: u64,
+/// }
+///
+/// sp_api::mock_impl_runtime_apis! {
+///     impl Balance<Block> for MockApi {
+///         type Error = sp_api::ApiError;
+///         #[advanced]
+///         fn get_balance(&self, at: &BlockId<Block>) -> Result<NativeOrEncoded<u64>, Self::Error> {
+///             println!("Being called at: {}", at);
+///
+///             Ok(self.balance.into())
+///         }
+///         #[advanced]
+///         fn set_balance(at: &BlockId<Block>, val: u64) -> Result<NativeOrEncoded<()>, Self::Error> {
+///             if let BlockId::Number(1) = at {
+///                 println!("Being called to set balance to: {}", val);
+///             }
+///
+///             Ok(().into())
 ///         }
 ///     }
 /// }
@@ -339,12 +394,42 @@ pub trait ConstructRuntimeApi<Block: BlockT, C: CallApiAt<Block>> {
 	fn construct_runtime_api<'a>(call: &'a C) -> ApiRef<'a, Self::RuntimeApi>;
 }
 
+/// An error describing which API call failed.
+#[cfg_attr(feature = "std", derive(Debug, thiserror::Error, Eq, PartialEq))]
+#[cfg_attr(feature = "std", error("Failed to execute API call {tag}"))]
+#[cfg(feature = "std")]
+pub struct ApiError {
+    tag: &'static str,
+    #[source]
+    error: codec::Error,
+}
+
+#[cfg(feature = "std")]
+impl From<(&'static str, codec::Error)> for ApiError {
+    fn from((tag, error): (&'static str, codec::Error)) -> Self {
+        Self {
+            tag,
+            error,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl ApiError {
+	pub fn new(tag: &'static str, error: codec::Error) -> Self {
+		Self {
+			tag,
+			error,
+		}
+	}
+}
+
 /// Extends the runtime api traits with an associated error type. This trait is given as super
 /// trait to every runtime api trait.
 #[cfg(feature = "std")]
 pub trait ApiErrorExt {
 	/// Error type used by the runtime apis.
-	type Error: std::fmt::Debug + From<String>;
+	type Error: std::fmt::Debug + From<ApiError>;
 }
 
 /// Extends the runtime api implementation with some common functionality.
@@ -353,15 +438,15 @@ pub trait ApiExt<Block: BlockT>: ApiErrorExt {
 	/// The state backend that is used to store the block states.
 	type StateBackend: StateBackend<HashFor<Block>>;
 
-	/// The given closure will be called with api instance. Inside the closure any api call is
-	/// allowed. After doing the api call, the closure is allowed to map the `Result` to a
-	/// different `Result` type. This can be important, as the internal data structure that keeps
-	/// track of modifications to the storage, discards changes when the `Result` is an `Err`.
-	/// On `Ok`, the structure commits the changes to an internal buffer.
-	fn map_api_result<F: FnOnce(&Self) -> result::Result<R, E>, R, E>(
+	/// Execute the given closure inside a new transaction.
+	///
+	/// Depending on the outcome of the closure, the transaction is committed or rolled-back.
+	///
+	/// The internal result of the closure is returned afterwards.
+	fn execute_in_transaction<F: FnOnce(&Self) -> TransactionOutcome<R>, R>(
 		&self,
-		map_call: F,
-	) -> result::Result<R, E> where Self: Sized;
+		call: F,
+	) -> R where Self: Sized;
 
 	/// Checks if the given api is implemented and versions match.
 	fn has_api<A: RuntimeApiInfo + ?Sized>(
@@ -453,7 +538,7 @@ pub struct CallApiAtParams<'a, Block: BlockT, C, NC, Backend: StateBackend<HashF
 #[cfg(feature = "std")]
 pub trait CallApiAt<Block: BlockT> {
 	/// Error type used by the implementation.
-	type Error: std::fmt::Debug + From<String>;
+	type Error: std::fmt::Debug + From<ApiError>;
 
 	/// The state backend that is used to store the block states.
 	type StateBackend: StateBackend<HashFor<Block>>;

@@ -19,18 +19,18 @@
 
 #![cfg(test)]
 
-use crate::{Trait, Module, GenesisConfig};
+use crate::{Config, Module, GenesisConfig};
 use sp_consensus_aura::ed25519::AuthorityId;
 use sp_runtime::{
-	traits::IdentityLookup, Perbill,
+	traits::IdentityLookup,
 	testing::{Header, UintAuthorityId},
 };
-use frame_support::{impl_outer_origin, parameter_types, weights::Weight};
+use frame_support::{impl_outer_origin, parameter_types};
 use sp_io;
 use sp_core::H256;
 
 impl_outer_origin!{
-	pub enum Origin for Test  where system = frame_system {}
+	pub enum Origin for Test where system = frame_system {}
 }
 
 // Workaround for https://github.com/rust-lang/rust/issues/26925 . Remove when sorted.
@@ -39,13 +39,16 @@ pub struct Test;
 
 parameter_types! {
 	pub const BlockHashCount: u64 = 250;
-	pub const MaximumBlockWeight: Weight = 1024;
-	pub const MaximumBlockLength: u32 = 2 * 1024;
-	pub const AvailableBlockRatio: Perbill = Perbill::one();
+	pub BlockWeights: frame_system::limits::BlockWeights =
+		frame_system::limits::BlockWeights::simple_max(1024);
 	pub const MinimumPeriod: u64 = 1;
 }
 
-impl frame_system::Trait for Test {
+impl frame_system::Config for Test {
+	type BaseCallFilter = ();
+	type BlockWeights = ();
+	type BlockLength = ();
+	type DbWeight = ();
 	type Origin = Origin;
 	type Index = u64;
 	type BlockNumber = u64;
@@ -57,27 +60,22 @@ impl frame_system::Trait for Test {
 	type Header = Header;
 	type Event = ();
 	type BlockHashCount = BlockHashCount;
-	type MaximumBlockWeight = MaximumBlockWeight;
-	type DbWeight = ();
-	type BlockExecutionWeight = ();
-	type ExtrinsicBaseWeight = ();
-	type MaximumExtrinsicWeight = MaximumBlockWeight;
-	type AvailableBlockRatio = AvailableBlockRatio;
-	type MaximumBlockLength = MaximumBlockLength;
 	type Version = ();
-	type ModuleToIndex = ();
+	type PalletInfo = ();
 	type AccountData = ();
 	type OnNewAccount = ();
 	type OnKilledAccount = ();
+	type SystemWeightInfo = ();
 }
 
-impl pallet_timestamp::Trait for Test {
+impl pallet_timestamp::Config for Test {
 	type Moment = u64;
 	type OnTimestampSet = Aura;
 	type MinimumPeriod = MinimumPeriod;
+	type WeightInfo = ();
 }
 
-impl Trait for Test {
+impl Config for Test {
 	type AuthorityId = AuthorityId;
 }
 
